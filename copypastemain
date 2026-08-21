@@ -3,22 +3,6 @@
 #include <ESPmDNS.h>
 #include <DHT.h>
 #include <Preferences.h>
-#include <pgmspace.h>
-#include <stdlib.h>
-#include "time.h"
-
-// Configurações de NTP
-const char* ntpServer = "a.st1.ntp.br"; // Servidor NTP público do Brasil
-const long gmtOffset_sec = -10800;       // Horário de Brasília (UTC-3 = -3 * 3600)
-const int daylightOffset_sec = 0;
-unsigned long tempoUltimoNTP = 0;
-const unsigned long INTERVALO_NTP = 86400000; // Sincroniza a cada 24h (em ms)
-
-// Parâmetros de Autenticação e Segurança
-String senhaSistema = "123456";         // Mínimo de 6 caracteres (salvo na NVS)
-bool modoManualAutenticado = false;
-int tentativasFalhasAuth = 0;
-unsigned long tempoBloqueioAuth = 0;
 
 WebServer server(80);
 Preferences prefs;
@@ -67,11 +51,10 @@ float duracaoDia = 12.0;
 
 const float TEMP_MARGEM = 1.0;       
 
-// parâmetros do Relógio (Início padrão: 06:00)
+// Relógio Simulado (Padrão: 06:00)
 int horaSimulada = 6;
 int minutoSimulado = 0;
 unsigned long tempoRelogio = 0;
-unsigned long tempoAtual = 0;
 
 // Variáveis Globais de Estado
 bool automacaoAtiva = true;   
@@ -86,369 +69,13 @@ unsigned long cronometroUmidade = 0;
 
 DHT dht(DHTPIN, DHTTYPE);
 
-// Buffer do monitor serial e ponteiro do Delta Log
+// Buffer do monitor serial
 String serialBuffer = "";
-const size_t MAX_BUFFER_SIZE = 10000;
-unsigned long totalBytesLog = 0;
-
-// --- ESTRUTURA HTML ARMAZENADA NA MEMÓRIA FLASH (PROGMEM) ---
-const char INDEX_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html lang='pt-BR'><head>
-<meta charset='UTF-8'>
-<meta name='viewport' content='width=device-width, initial-scale=1.0'>
-<title>Greenhouse Link v3.0</title>
-<style>
-body { font-family: Arial, sans-serif; background-color: #f0f2f5; margin: 20px; display: flex; flex-direction: column; gap: 20px; }
-.box { background: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-h2, h3, h4 { margin-top: 0; color: #2e7d32; font-size: 1.2rem; border-bottom: 2px solid #e8f5e9; padding-bottom: 8px; }
-h4 { border-bottom: none; font-size: 1.0rem; margin-bottom: 8px; }
-.sensor-row { display: flex; justify-content: space-around; background: #e8f5e9; padding: 15px; border-radius: 8px; margin-bottom: 10px; font-size: 1.2rem; font-weight: bold; color: #1b5e20; }
-.clock-row { background: #e8f5e9; padding: 10px 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; color: #1b5e20; display: flex; justify-content: space-between; }
-.pin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }
-.pin-btn { padding: 12px 8px; border-radius: 5px; color: white; font-weight: bold; text-align: center; border: none; width: 100%; font-size: 0.85rem; }
-.clickable { cursor: pointer; transition: transform 0.1s; }
-.clickable:hover { opacity: 0.85; transform: scale(1.02); }
-.on { background-color: #28a745; box-shadow: 0 0 8px #28a745; }
-.off { background-color: #6c757d; }
-.btn-control { display: inline-block; padding: 12px 24px; font-size: 1rem; font-weight: bold; color: white; border-radius: 5px; border: none; cursor: pointer; }
-.btn-pause { background-color: #dc3545; }
-.btn-resume { background-color: #28a745; }
-.config-info { background: #f8f9fa; padding: 12px; border-radius: 6px; margin: 15px 0; border-left: 4px solid #2e7d32; }
-.profile-btns { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; }
-.btn-profile { padding: 8px 16px; border: 1px solid #2e7d32; background: white; color: #2e7d32; border-radius: 4px; font-weight: bold; cursor: pointer; }
-.btn-profile.active { background: #2e7d32; color: white; }
-.btn-profile:disabled { opacity: 0.5; cursor: not-allowed; border-color: #ccc; color: #666; background: #eee; }
-.input-group { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
-.input-group label { width: 220px; font-weight: bold; font-size: 0.9rem; }
-.input-group input, .sub-box input, select { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }
-.input-group .time-input { width: 50px; text-align: center; }
-.btn-action { padding: 8px 16px; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin-right: 10px; }
-.btn-action:disabled { background: #ccc !important; cursor: not-allowed; }
-.sub-box { background: #f8f9fa; padding: 12px; border-radius: 6px; margin-top: 10px; border-left: 4px solid #2e7d32; }
-.sub-box form { margin-bottom: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.dos-prompt { background-color: #000000; color: #00ff00; font-family: 'Courier New', Courier, monospace; padding: 15px; border-radius: 5px; height: 250px; overflow-y: auto; white-space: pre-wrap; font-size: 0.9rem; line-height: 1.2; }
-</style></head><body>
-
-<div class='box'>
-<h2>1. Status da Estufa</h2>
-<div class='sensor-row'>
-<div>Temp: <span id='valTemp'>--</span> &deg;C</div>
-<div>Umid: <span id='valUmid'>--</span> %</div>
-</div>
-<div class='clock-row'>
-<div>Hora Simulada: <span id='valHora'>--:--</span></div>
-<div>Tempo Ligado: <span id='valUptime'>000:00:00</span> <small style='font-size:0.75rem;'>(DDD:HH:MM)</small></div>
-</div>
-<div class='pin-grid'>
-<button id='btnAq' class='pin-btn off' onclick='cliquePino(33)'>Aquecedor<br><small id='txtAq'>INATIVO</small></button>
-<button id='btnVen' class='pin-btn off' onclick='cliquePino(32)'>Ventilador<br><small id='txtVen'>INATIVO</small></button>
-<button id='btnUm1' class='pin-btn off' onclick='cliquePino(4)'>Umidificador<br><small id='txtUm1'>INATIVO</small></button>
-<button id='btnUm2' class='pin-btn off' onclick='cliquePino(14)'>Gatilho Umid.<br><small id='txtUm2'>INATIVO</small></button>
-<button id='btnLB1' class='pin-btn off' onclick='cliquePino(27)'>Luz Branca 1<br><small id='txtLB1'>INATIVO</small></button>
-<button id='btnLB2' class='pin-btn off' onclick='cliquePino(12)'>Luz Branca 2<br><small id='txtLB2'>INATIVO</small></button>
-<button id='btnLVerm' class='pin-btn off' onclick='cliquePino(26)'>Luz Vermelha<br><small id='txtLVerm'>INATIVO</small></button>
-<button id='btnLViol' class='pin-btn off' onclick='cliquePino(13)'>Luz Violeta<br><small id='txtLViol'>INATIVO</small></button>
-<button id='btnLed' class='pin-btn off' onclick='cliquePino(2)'>Indicador LED<br><small id='txtLed'>INATIVO</small></button>
-</div></div>
-
-<div class='box'>
-<h2>2. Controle de Automação & Configuração</h2>
-<div id='boxAutomacao'>Carregando status...</div>
-
-<div class='config-info'>
-<div><strong>Perfil Ativo:</strong> <span id='lblPerfil'>--</span></div>
-<div><strong>Modo de Iluminação:</strong> <span id='lblModoIlu'>--</span></div>
-<div><strong>Duração do Dia:</strong> <span id='lblDurDia'>--</span> h (Somente modo iluminação Plantas)</div>
-<div><strong>Temp. Alvo:</strong> <span id='lblTAlvo'>--</span> &deg;C (&plusmn;1.0 &deg;C)</div>
-<div><strong>Umid. Mínima:</strong> <span id='lblUMin'>--</span> % (Desliga em <span id='lblUDesl'>--</span> %)</div>
-<div><strong>Ciclo Dia/Noite:</strong> <span id='lblCAuto'>--</span></div>
-<button id="btnLogin" class="btn-action" style="background:#007bff; margin-bottom:15px; width:100%;" onclick="fazerLogin()">Fazer Login / Desbloquear Configurações</button>
-</div>
-
-<div style='font-size:0.9rem; font-weight:bold; margin-bottom:5px;'>Perfis Disponíveis:</div>
-<div class='profile-btns'>
-<button id='btnInc' class='btn-profile' onclick="setPerfil('inc')">Incubação</button>
-<button id='btnFrut' class='btn-profile' onclick="setPerfil('frut')">Frutificação</button>
-<button id='btnPers' class='btn-profile' onclick="setPerfil('pers')">Personalizado</button>
-</div>
-
-<div style='font-size:0.9rem; font-weight:bold; margin-bottom:10px;'>Ajuste Manual dos Parâmetros:</div>
-
-<div class='input-group'>
-<label for='inHora'>Definir hora simulada (HH:MM):</label>
-<input type='number' id='inHora' class='time-input' min='0' max='23' placeholder='HH'> : 
-<input type='number' id='inMin' class='time-input' min='0' max='59' placeholder='MM'> 
-<button id='btnApplyHora' class='btn-action' style='background:#007bff;' onclick='aplicarHora()'>Aplicar Hora</button>
-</div>
-
-<div class='input-group'>
-<label>Ciclo dia e noite simulada:</label>
-<button id='btnToggleCiclo' class='btn-action' style='background:#007bff; margin:0;' onclick='toggleCicloAuto()'>--</button>
-</div>
-
-<div class='input-group'>
-<label>Seletor de Modo de Ciclo do Dia:</label>
-<button id='btnModoCog' class='btn-profile' onclick="setModoIlu('Cogumelos')">Cogumelos</button>
-<button id='btnModoPlan' class='btn-profile' onclick="setModoIlu('Plantas')">Plantas</button>
-</div>
-
-<div class='input-group'>
-<label for='inDur'>Duração do ciclo dia (horas):</label>
-<input type='number' id='inDur' step='0.5' min='1.0' max='23.0' placeholder='Ex: 12.0'> 
-<button id='btnApplyDur' class='btn-action' style='background:#007bff;' onclick='aplicarDuracao()'>Aplicar Duração</button>
-</div>
-
-<div class='input-group'>
-<label for='inTemp'>Temp. Alvo (&deg;C):</label>
-<input type='number' id='inTemp' step='0.5' placeholder='Ex: 22.0'> 
-<button id='btnApplyTemp' class='btn-action' style='background:#007bff;' onclick='aplicarTemp()'>Aplicar</button>
-</div>
-
-<div class='input-group'>
-<label for='inUmid'>Umid. Mínima (%):</label>
-<input type='number' id='inUmid' step='1.0' placeholder='Ex: 75'> 
-<button id='btnApplyUmid' class='btn-action' style='background:#007bff;' onclick='aplicarUmid()'>Aplicar</button>
-</div>
-
-<div style='margin-top:15px;'>
-<button class="btn-action" style="background-color:#ff9800; margin-top:10px;" onclick="alterarSenha()">Alterar Senha do Sistema</button>
-<button id='btnReset' class='btn-action' style='background-color:#dc3545;' onclick='restaurarPerfil()'>Restaurar padrão de fábrica</button>
-</div>
-
-<p id='txtAviso' style='color:#dc3545; font-size:0.85rem; margin-top:10px;'></p>
-</div>
-
-<div class='box'>
-<h2>3. Monitor Serial</h2>
-<div class='dos-prompt' id='dosConsole'></div>
-</div>
-
-<div class='box'>
-<h2>4. Conectividade</h2>
-<form action='/set_wifi_mode' method='POST'>
-Modo de Operação: <select id='selWifiMode' name='mode' onchange='this.form.submit()'>
-<option value='0'>Apenas Ponto de Acesso (AP)</option>
-<option value='1'>Cliente Wi-Fi (STA + AP Automático)</option>
-</select></form>
-
-<div class='sub-box'>
-<h4>Configuração AP (ponto de acesso wireless)</h4>
-<form action='/set_ap_creds' method='POST'>
-SSID AP: <input type='text' id='inSsidAP' name='ssid' value=''> 
-Senha AP: <input type='password' name='pass' placeholder='********'> 
-<button class='btn-action' style='background:#28a745;' type='submit'>Salvar AP</button>
-</form>
-</div>
-
-<div class='sub-box'>
-<h4>Configuração STA (modo Cliente Wi-Fi)</h4>
-<form action='/set_sta_creds' method='POST'>
-Rede Wi-Fi: <input type='text' id='inSsidSTA' name='ssid' value=''> 
-Senha Wi-Fi: <input type='password' name='pass' placeholder='********'> 
-<button class='btn-action' style='background:#28a745;' type='submit'>Salvar conexão WLAN</button>
-</form>
-<p><small>Endereço local em modo Cliente: <b>http://greenhouse-link.local</b></small></p>
-</div>
-
-<div style='margin-top:15px; border-top:1px solid #eee; padding-top:10px;'>
-<button class='btn-action' style='background-color:#ff9800;' onclick='reiniciarESP()'>Reiniciar ESP32</button>
-<small style='color:#666;'>Use este botão para aplicar alterações de rede.</small>
-</div></div>
-
-<script>
-// Trata e substitui automaticamente os caracteres especiais brasileiros
-document.body.innerHTML = document.body.innerHTML
-  .replaceAll('\\u00e7', 'ç')
-  .replaceAll('\\u00e3', 'ã')
-  .replaceAll('\\u00e1', 'á')
-  .replaceAll('\\u00e2', 'â')
-  .replaceAll('\\u00ea', 'ê')
-  .replaceAll('\\u00ed', 'í')
-  .replaceAll('\\u00f3', 'ó')
-  .replaceAll('\\u00fa', 'ú');
-let dadosInicializados = false;
-let logPos = 0;
-
-function fazerLogin() {
-  let senha = prompt("Digite a senha do sistema:");
-  if (!senha) return;
-  let formData = new FormData();
-  formData.append("pass", senha);
-  fetch('/login', { method: 'POST', body: formData })
-    .then(r => r.json())
-    .then(d => {
-      if (d.status === 'ok') {
-        alert('Autenticação realizada com sucesso!');
-        atualizarStatus();
-      } else if (d.status === 'bloqueado') {
-        alert('Acesso temporariamente bloqueado por força bruta! Aguarde ' + d.restante + ' segundos.');
-      } else {
-        alert('Senha incorreta! Tentativa ' + d.tentativas + ' de 3.');
-      }
-    })
-    .catch(() => alert('Erro de comunicação com o ESP32.'));
-}
-
-function alterarSenha() {
-  let novaSenha = prompt("Digite a nova senha do sistema (mínimo 6 caracteres):");
-  if (!novaSenha) return;
-  if (novaSenha.length < 6) {
-    alert("A senha deve ter no mínimo 6 caracteres!");
-    return;
-  }
-  let formData = new FormData();
-  formData.append("pass", novaSenha);
-  fetch('/set_sys_pass', { method: 'POST', body: formData })
-    .then(r => {
-      if (r.ok) {
-        alert("Nova senha salva com sucesso na memória NVS!");
-      } else if (r.status === 403) {
-        alert("Acesso Negado! Faça o login primeiro antes de alterar a senha.");
-      } else {
-        alert("Erro ao alterar a senha. A senha deve ter no mínimo 6 caracteres.");
-      }
-    })
-    .catch(() => alert("Erro de comunicação com o ESP32."));
-}
-
-function atualizarStatus() {
-  fetch('/status').then(r => r.json()).then(d => {
-    document.getElementById('valTemp').innerText = d.temp;
-    document.getElementById('valUmid').innerText = d.umid;
-    document.getElementById('valHora').innerText = d.horaSim;
-    document.getElementById('valUptime').innerText = d.uptime;
-    document.getElementById('lblPerfil').innerText = d.perfil;
-    document.getElementById('lblModoIlu').innerText = d.modoIlu;
-    document.getElementById('lblDurDia').innerText = d.durDia;
-    document.getElementById('lblTAlvo').innerText = d.tAlvo;
-    document.getElementById('lblUMin').innerText = d.uMin;
-    document.getElementById('lblUDesl').innerText = (parseFloat(d.uMin) + 5.0).toFixed(1);
-    document.getElementById('lblCAuto').innerText = d.cAuto ? 'AUTOMÁTICO' : 'MANUAL';
-    if (!dadosInicializados) {
-      document.getElementById('selWifiMode').value = d.modoWifi;
-      document.getElementById('inSsidAP').value = d.ssidAP;
-      document.getElementById('inSsidSTA').value = d.ssidSTA;
-      dadosInicializados = true;
-    }
-    let btnC = document.getElementById('btnToggleCiclo');
-    btnC.innerText = d.cAuto ? 'AUTOMÁTICO' : 'MANUAL';
-    btnC.style.backgroundColor = d.cAuto ? '#28a745' : '#6c757d';
-    let autoBox = document.getElementById('boxAutomacao');
-    let aviso = document.getElementById('txtAviso');
-    let lock = d.auto; 
-    if(d.auto) {
-      autoBox.innerHTML = "<p>Estado Atual: <strong style='color:#28a745;'>AUTOMÁTICO (SISTEMA ATIVO)</strong></p><button class='btn-control btn-pause' onclick='toggleAutomacao()'>PAUSAR AUTOMAÇÃO</button>";
-      aviso.innerText = '* Para alterar perfis ou parâmetros manuais, pause a automação primeiro.';
-    } else {
-      autoBox.innerHTML = "<p>Estado Atual: <strong style='color:#dc3545;'>PAUSADO (MODO MANUAL / CONFIGURAÇÃO)</strong></p><p><small>* Você pode acionar a Caixa 1 ou alterar as configurações abaixo.</small></p><button class='btn-control btn-resume' onclick='toggleAutomacao()'>RETOMAR AUTOMAÇÃO</button>";
-      aviso.innerText = '';
-    }
-    document.getElementById('btnInc').className = 'btn-profile' + (d.perfil === 'Incubação' ? ' active' : '');
-    document.getElementById('btnFrut').className = 'btn-profile' + (d.perfil === 'Frutificação' ? ' active' : '');
-    document.getElementById('btnPers').className = 'btn-profile' + (d.perfil === 'Personalizado' ? ' active' : '');
-    document.getElementById('btnModoCog').className = 'btn-profile' + (d.modoIlu === 'Cogumelos' ? ' active' : '');
-    document.getElementById('btnModoPlan').className = 'btn-profile' + (d.modoIlu === 'Plantas' ? ' active' : '');
-    document.getElementById('btnInc').disabled = lock;
-    document.getElementById('btnFrut').disabled = lock;
-    document.getElementById('btnPers').disabled = lock;
-    document.getElementById('btnModoCog').disabled = lock;
-    document.getElementById('btnModoPlan').disabled = lock;
-    document.getElementById('btnToggleCiclo').disabled = lock;
-    document.getElementById('btnReset').disabled = lock;
-    document.getElementById('btnApplyHora').disabled = lock;
-    document.getElementById('btnApplyDur').disabled = lock;
-    document.getElementById('btnApplyTemp').disabled = lock;
-    document.getElementById('btnApplyUmid').disabled = lock;
-    document.getElementById('inTemp').disabled = lock;
-    document.getElementById('inUmid').disabled = lock;
-    document.getElementById('inHora').disabled = lock;
-    document.getElementById('inMin').disabled = lock;
-    document.getElementById('inDur').disabled = lock;
-    
-    function renderBtn(idBtn, idTxt, ativo, auto) {
-      let b = document.getElementById(idBtn);
-      let t = document.getElementById(idTxt);
-      b.className = 'pin-btn ' + (ativo ? 'on' : 'off') + (auto ? '' : ' clickable');
-      t.innerText = (ativo ? 'ATIVO' : 'INATIVO') + (auto ? '' : ' (Clique)');
-    }
-    
-    renderBtn('btnAq', 'txtAq', d.aq, d.auto);
-    renderBtn('btnVen', 'txtVen', d.ven, d.auto);
-    renderBtn('btnUm1', 'txtUm1', d.um1, d.auto);
-    renderBtn('btnUm2', 'txtUm2', d.um2, d.auto);
-    renderBtn('btnLB1', 'txtLB1', d.lB1, d.auto);
-    renderBtn('btnLVerm', 'txtLVerm', d.lVerm, d.auto);
-    renderBtn('btnLB2', 'txtLB2', d.lB2, d.auto);
-    renderBtn('btnLViol', 'txtLViol', d.lViol, d.auto);
-    renderBtn('btnLed', 'txtLed', d.led, d.auto);
-  });
-
-  fetch('/log?desde=' + logPos).then(r => r.json()).then(d => {
-    if (d.delta && d.delta.length > 0) {
-      let consoleDiv = document.getElementById('dosConsole');
-      let rolar = (consoleDiv.scrollHeight - consoleDiv.clientHeight <= consoleDiv.scrollTop + 20);
-      if (logPos === 0 || d.delta.length >= 5000) {
-        consoleDiv.innerText = d.delta;
-      } else {
-        consoleDiv.innerText += d.delta;
-      }
-      if(rolar) consoleDiv.scrollTop = consoleDiv.scrollHeight;
-    }
-    logPos = d.pos;
-  });
-}
-
-function toggleAutomacao() { fetch('/toggleAutomacao').then(() => atualizarStatus()); }
-function cliquePino(p) { fetch('/togglePino?pin=' + p).then(() => atualizarStatus()); }
-function setPerfil(p) { fetch('/setPerfil?p=' + p).then(() => atualizarStatus()); }
-function toggleCicloAuto() { fetch('/toggleCicloAuto').then(() => atualizarStatus()); }
-function setModoIlu(m) { fetch('/setModoIlu?m=' + m).then(() => atualizarStatus()); }
-
-function aplicarTemp() {
-  let t = document.getElementById('inTemp').value;
-  if(t !== '') fetch('/setTempAlvo?t=' + t).then(() => { document.getElementById('inTemp').value = ''; atualizarStatus(); });
-}
-
-function aplicarUmid() {
-  let u = document.getElementById('inUmid').value;
-  if(u !== '') fetch('/setUmidMin?u=' + u).then(() => { document.getElementById('inUmid').value = ''; atualizarStatus(); });
-}
-
-function restaurarPerfil() {
-  if(confirm('Restaurar o perfil ativo para as configurações de fábrica?')) {
-    fetch('/restaurarPerfil').then(() => atualizarStatus());
-  }
-}
-
-function aplicarHora() {
-  let h = document.getElementById('inHora').value;
-  let m = document.getElementById('inMin').value;
-  if(h !== '' && m !== '') fetch('/setHora?h=' + h + '&m=' + m).then(() => { document.getElementById('inHora').value=''; document.getElementById('inMin').value=''; atualizarStatus(); });
-}
-
-function aplicarDuracao() {
-  let d = document.getElementById('inDur').value;
-  if(d !== '') fetch('/setDuracaoDia?d=' + d).then(() => { document.getElementById('inDur').value=''; atualizarStatus(); });
-}
-
-function reiniciarESP() {
-  if(confirm('Tem certeza de que deseja reiniciar o ESP32?')) {
-    fetch('/restart').then(() => alert('Comando de reinicialização enviado! Aguarde alguns segundos e reconecte.'));
-  }
-}
-
-setInterval(atualizarStatus, 3000);
-atualizarStatus();
-</script>
-</body></html>
-)rawliteral";
+const size_t MAX_BUFFER_SIZE = 5000;
 
 void logMessage(String msg) {
   Serial.println(msg);
-  String linha = msg + "\n";
-  serialBuffer += linha;
-  totalBytesLog += linha.length();
-  
+  serialBuffer += msg + "\n";
   if (serialBuffer.length() > MAX_BUFFER_SIZE) {
     serialBuffer = serialBuffer.substring(serialBuffer.length() - MAX_BUFFER_SIZE);
   }
@@ -562,142 +189,42 @@ void restaurarFabricaPerfilAtivo() {
   if (automacaoAtiva) processarIluminacao();
 }
 
-// Rota de Telemetria Ultraleve (<300 bytes)
 void handleStatus() {
-  char json[600];
-  snprintf(json, sizeof(json),
-    "{\"temp\":\"%.1f\",\"umid\":\"%.1f\",\"horaSim\":\"%s\",\"uptime\":\"%s\","
-    "\"tAlvo\":\"%.1f\",\"uMin\":\"%.1f\",\"perfil\":\"%s\",\"modoIlu\":\"%s\","
-    "\"durDia\":\"%.1f\",\"cAuto\":%s,\"auto\":%s,\"modoWifi\":%d,"
-    "\"ssidAP\":\"%s\",\"ssidSTA\":\"%s\","
-    "\"aq\":%s,\"ven\":%s,\"um1\":%s,\"um2\":%s,"
-    "\"lB1\":%s,\"lVerm\":%s,\"lB2\":%s,\"lViol\":%s,\"led\":%s}",
-    temperaturaAtual, umidadeAtual, getHoraSimuladaString().c_str(), getUptimeString().c_str(),
-    tempAlvo, umidMinima, perfilAtivo.c_str(), modoIluminacao.c_str(),
-    duracaoDia, cicloAuto ? "true" : "false", automacaoAtiva ? "true" : "false", modoWifi,
-    ssidAP.c_str(), ssidSTA.c_str(),
-    (digitalRead(RELE_AQUECIMENTO) == LOW) ? "true" : "false",
-    (digitalRead(RELE_VENTILADOR) == LOW) ? "true" : "false",
-    (digitalRead(RELE_UMIDADE_1) == LOW) ? "true" : "false",
-    (digitalRead(RELE_UMIDADE_2) == LOW) ? "true" : "false",
-    (digitalRead(LUZ_BRANCA1) == LOW) ? "true" : "false",
-    (digitalRead(LUZ_VERMELHA) == LOW) ? "true" : "false",
-    (digitalRead(LUZ_BRANCA2) == LOW) ? "true" : "false",
-    (digitalRead(LUZ_VIOLETA) == LOW) ? "true" : "false",
-    (digitalRead(LED_BUILTIN_PIN) == HIGH) ? "true" : "false"
-  );
-  server.send(200, "application/json", json);
-}
-
-// Sincronização Não-Bloqueante de Hora NTP
-void sincronizarNTP() {
-  if (WiFi.status() == WL_CONNECTED) {
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo)) {
-      horaSimulada = timeinfo.tm_hour;
-      minutoSimulado = timeinfo.tm_min;
-      tempoRelogio = millis(); 
-      logMessage("[NTP] Hora oficial sincronizada com sucesso: " + getHoraSimuladaString());
-    } else {
-      logMessage("[NTP] Falha ao obter hora do servidor NTP.");
-    }
-  }
-}
-
-// Rota de Autenticação de Usuário e Controle Anti-Força Bruta
-void handleLogin() {
-  unsigned long agora = millis();
+  String json = "{";
+  json += "\"temp\":\"" + String(temperaturaAtual, 1) + "\",";
+  json += "\"umid\":\"" + String(umidadeAtual, 1) + "\",";
+  json += "\"horaSim\":\"" + getHoraSimuladaString() + "\",";
+  json += "\"uptime\":\"" + getUptimeString() + "\",";
+  json += "\"tAlvo\":\"" + String(tempAlvo, 1) + "\",";
+  json += "\"uMin\":\"" + String(umidMinima, 1) + "\",";
+  json += "\"perfil\":\"" + perfilAtivo + "\",";
+  json += "\"modoIlu\":\"" + modoIluminacao + "\",";
+  json += "\"durDia\":\"" + String(duracaoDia, 1) + "\",";
+  json += "\"cAuto\":" + String(cicloAuto ? "true" : "false") + ",";
+  json += "\"auto\":" + String(automacaoAtiva ? "true" : "false") + ",";
+  json += "\"aq\":" + String(digitalRead(RELE_AQUECIMENTO) == LOW ? "true" : "false") + ",";
+  json += "\"ven\":" + String(digitalRead(RELE_VENTILADOR) == LOW ? "true" : "false") + ",";
+  json += "\"um1\":" + String(digitalRead(RELE_UMIDADE_1) == LOW ? "true" : "false") + ",";
+  json += "\"um2\":" + String(digitalRead(RELE_UMIDADE_2) == LOW ? "true" : "false") + ",";
+  json += "\"lB1\":" + String(digitalRead(LUZ_BRANCA1) == LOW ? "true" : "false") + ",";
+  json += "\"lVerm\":" + String(digitalRead(LUZ_VERMELHA) == LOW ? "true" : "false") + ",";
+  json += "\"lB2\":" + String(digitalRead(LUZ_BRANCA2) == LOW ? "true" : "false") + ",";
+  json += "\"lViol\":" + String(digitalRead(LUZ_VIOLETA) == LOW ? "true" : "false") + ",";
+  json += "\"led\":" + String(digitalRead(LED_BUILTIN_PIN) == HIGH ? "true" : "false") + ",";
   
-  // Bloqueio temporário de 120s após 3 tentativas erradas
-  if (tentativasFalhasAuth >= 3) {
-    if (agora - tempoBloqueioAuth < 120000) {
-      unsigned long restante = (120000 - (agora - tempoBloqueioAuth)) / 1000;
-      logMessage("[AUTH] Tentativa bloqueada por força bruta! IP: " + server.client().remoteIP().toString());
-      server.send(429, "application/json", "{\"status\":\"bloqueado\",\"restante\":" + String(restante) + "}");
-      return;
-    } else {
-      tentativasFalhasAuth = 0; // Libera a trava após decorridos 120s
-    }
-  }
-
-  if (server.hasArg("pass")) {
-    String p = server.arg("pass");
-    String user = (server.hasArg("user") && server.arg("user").length() > 0) ? server.arg("user") : "Anônimo";
-    String ip = server.client().remoteIP().toString();
-    String ua = server.header("User-Agent"); // Dispositivo / Navegador
-
-    if (p == senhaSistema) {
-      tentativasFalhasAuth = 0;
-      modoManualAutenticado = true;
-      logMessage("[AUTH] Login OK! IP: " + ip + " | Usuário: " + user + " | Dispositivo: " + ua);
-      server.send(200, "application/json", "{\"status\":\"ok\"}");
-    } else {
-      tentativasFalhasAuth++;
-      if (tentativasFalhasAuth >= 3) tempoBloqueioAuth = agora;
-      logMessage("[AUTH] Senha Incorreta! IP: " + ip + " | Usuário: " + user + " (Tentativa " + String(tentativasFalhasAuth) + "/3)");
-      server.send(401, "application/json", "{\"status\":\"erro\",\"tentativas\":" + String(tentativasFalhasAuth) + "}");
-    }
-  } else {
-    server.send(400, "application/json", "{\"status\":\"invalid\"}");
-  }
-}
-
-// Alteração da Senha do Sistema
-void handleSetSysPass() {
-  if (modoManualAutenticado && server.hasArg("pass")) {
-    String nPass = server.arg("pass");
-    if (nPass.length() >= 6) {
-      senhaSistema = nPass;
-      prefs.begin("greenhouse", false);
-      prefs.putString("sys_pass", senhaSistema);
-      prefs.end();
-      logMessage("[SEGURANÇA] Nova senha do sistema configurada com sucesso!");
-      server.send(200, "text/plain", "OK");
-    } else {
-      logMessage("[ERRO] A senha precisa ter no mínimo 6 caracteres!");
-      server.send(400, "text/plain", "Senha muito curta");
-    }
-  } else {
-    server.send(403, "text/plain", "Não autorizado");
-  }
-}
-
-
-// Rota Dedicada para Transmissão Incremental de Log Delta
-void handleLog() {
-  unsigned long desde = 0;
-  if (server.hasArg("desde")) {
-  desde = strtoul(server.arg("desde").c_str(), nullptr, 10);
-  }
+  String logEscaped = serialBuffer;
+  logEscaped.replace("\\", "\\\\");
+  logEscaped.replace("\"", "\\\"");
+  logEscaped.replace("\n", "\\n");
+  logEscaped.replace("\r", "");
   
-  String delta = "";
-  if (desde < totalBytesLog) {
-    unsigned long diff = totalBytesLog - desde;
-    if (diff > serialBuffer.length()) {
-      delta = serialBuffer;
-    } else {
-      size_t startPos = serialBuffer.length() - diff;
-      delta = serialBuffer.substring(startPos);
-    }
-  }
-
-  String deltaEscaped = delta;
-  deltaEscaped.replace("\\", "\\\\");
-  deltaEscaped.replace("\"", "\\\"");
-  deltaEscaped.replace("\n", "\\n");
-  deltaEscaped.replace("\r", "");
-
-  String json = "{\"delta\":\"" + deltaEscaped + "\",\"pos\":" + String(totalBytesLog) + "}";
+  json += "\"log\":\"" + logEscaped + "\"";
+  json += "}";
+  
   server.send(200, "application/json", json);
 }
 
 void handleToggleAutomacao() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   automacaoAtiva = !automacaoAtiva;
   if (automacaoAtiva) {
     logMessage("[SISTEMA] Automação REATIVADA pelo usuário!");
@@ -709,11 +236,6 @@ if (!modoManualAutenticado) {
 }
 
 void handleTogglePino() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   if (!automacaoAtiva && server.hasArg("pin")) {
     int pin = server.arg("pin").toInt();
     int estadoAtual = digitalRead(pin);
@@ -724,11 +246,6 @@ if (!modoManualAutenticado) {
 }
 
 void handleSetPerfil() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   if (!automacaoAtiva && server.hasArg("p")) {
     String p = server.arg("p");
     if (p == "inc") carregarPerfil("Incubação");
@@ -740,11 +257,6 @@ if (!modoManualAutenticado) {
 }
 
 void handleToggleCicloAuto() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   if (!automacaoAtiva) {
     cicloAuto = !cicloAuto;
     salvarPerfilAtivo(tempAlvo, umidMinima, cicloAuto);
@@ -754,11 +266,6 @@ if (!modoManualAutenticado) {
 }
 
 void handleSetModoIluminacao() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   if (!automacaoAtiva && server.hasArg("m")) {
     String m = server.arg("m");
     if (m == "Cogumelos" || m == "Plantas") {
@@ -773,11 +280,6 @@ if (!modoManualAutenticado) {
 }
 
 void handleSetDuracaoDia() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   if (!automacaoAtiva && server.hasArg("d")) {
     float d = server.arg("d").toFloat();
     if (d >= 1.0 && d <= 23.0) {
@@ -794,11 +296,6 @@ if (!modoManualAutenticado) {
 }
 
 void handleSetTempAlvo() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   if (!automacaoAtiva && server.hasArg("t")) {
     float nTemp = server.arg("t").toFloat();
     if (nTemp >= 9.0 && nTemp <= 48.0) {
@@ -813,11 +310,6 @@ if (!modoManualAutenticado) {
 }
 
 void handleSetUmidMin() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   if (!automacaoAtiva && server.hasArg("u")) {
     float nUmid = server.arg("u").toFloat();
     if (nUmid >= 10.0 && nUmid <= 90.0) {
@@ -832,11 +324,6 @@ if (!modoManualAutenticado) {
 }
 
 void handleRestaurarPerfil() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   if (!automacaoAtiva) {
     restaurarFabricaPerfilAtivo();
     logMessage("[CONFIG] Padrões de fábrica restaurados para o perfil " + perfilAtivo);
@@ -845,11 +332,6 @@ if (!modoManualAutenticado) {
 }
 
 void handleSetHora() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   if (!automacaoAtiva && server.hasArg("h") && server.hasArg("m")) {
     int h = server.arg("h").toInt();
     int m = server.arg("m").toInt();
@@ -865,11 +347,6 @@ if (!modoManualAutenticado) {
 }
 
 void handleSetWifiMode() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   if (server.hasArg("mode")) {
     modoWifi = server.arg("mode").toInt();
     prefs.begin("greenhouse", false);
@@ -882,11 +359,6 @@ if (!modoManualAutenticado) {
 }
 
 void handleSetApCreds() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   if (server.hasArg("ssid") && server.hasArg("pass")) {
     String nSsid = server.arg("ssid");
     String nPass = server.arg("pass");
@@ -907,11 +379,6 @@ if (!modoManualAutenticado) {
 }
 
 void handleSetStaCreds() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   if (server.hasArg("ssid") && server.hasArg("pass")) {
     ssidSTA = server.arg("ssid");
     passSTA = server.arg("pass");
@@ -928,11 +395,6 @@ if (!modoManualAutenticado) {
 }
 
 void handleRestart() {
-if (!modoManualAutenticado) {
-  logMessage("[SEGURANÇA] Ação negada! Usuário não autenticado.");
-  server.send(403, "text/plain", "Não autorizado");
-  return;
-}
   logMessage("[SISTEMA] Reinicialização solicitada via Web interface...");
   server.send(200, "text/plain", "OK");
   delay(1000);
@@ -940,7 +402,295 @@ if (!modoManualAutenticado) {
 }
 
 void handleRoot() {
-  server.send_P(200, "text/html", INDEX_HTML);
+  String html = "<!DOCTYPE html><html lang='pt-BR'><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>Greenhouse Link v2.23</title>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; background-color: #f0f2f5; margin: 20px; display: flex; flex-direction: column; gap: 20px; }";
+  html += ".box { background: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }";
+  html += "h2, h3, h4 { margin-top: 0; color: #2e7d32; font-size: 1.2rem; border-bottom: 2px solid #e8f5e9; padding-bottom: 8px; }";
+  html += "h4 { border-bottom: none; font-size: 1.0rem; margin-bottom: 8px; }";
+  html += ".sensor-row { display: flex; justify-content: space-around; background: #e8f5e9; padding: 15px; border-radius: 8px; margin-bottom: 10px; font-size: 1.2rem; font-weight: bold; color: #1b5e20; }";
+  html += ".clock-row { background: #e8f5e9; padding: 10px 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; color: #1b5e20; display: flex; justify-content: space-between; }";
+  html += ".pin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }";
+  html += ".pin-btn { padding: 12px 8px; border-radius: 5px; color: white; font-weight: bold; text-align: center; border: none; width: 100%; font-size: 0.85rem; }";
+  html += ".clickable { cursor: pointer; transition: transform 0.1s; }";
+  html += ".clickable:hover { opacity: 0.85; transform: scale(1.02); }";
+  html += ".on { background-color: #28a745; box-shadow: 0 0 8px #28a745; }"; 
+  html += ".off { background-color: #6c757d; }"; 
+  html += ".btn-control { display: inline-block; padding: 12px 24px; font-size: 1rem; font-weight: bold; color: white; border-radius: 5px; border: none; cursor: pointer; }";
+  html += ".btn-pause { background-color: #dc3545; }";
+  html += ".btn-resume { background-color: #28a745; }";
+  html += ".config-info { background: #f8f9fa; padding: 12px; border-radius: 6px; margin: 15px 0; border-left: 4px solid #2e7d32; }";
+  html += ".profile-btns { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; }";
+  html += ".btn-profile { padding: 8px 16px; border: 1px solid #2e7d32; background: white; color: #2e7d32; border-radius: 4px; font-weight: bold; cursor: pointer; }";
+  html += ".btn-profile.active { background: #2e7d32; color: white; }";
+  html += ".btn-profile:disabled { opacity: 0.5; cursor: not-allowed; border-color: #ccc; color: #666; background: #eee; }";
+  html += ".input-group { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }";
+  html += ".input-group label { width: 220px; font-weight: bold; font-size: 0.9rem; }";
+  html += ".input-group input, .sub-box input, select { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }";
+  html += ".input-group .time-input { width: 50px; text-align: center; }";
+  html += ".btn-action { padding: 8px 16px; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin-right: 10px; }";
+  html += ".btn-action:disabled { background: #ccc !important; cursor: not-allowed; }";
+  html += ".sub-box { background: #f8f9fa; padding: 12px; border-radius: 6px; margin-top: 10px; border-left: 4px solid #2e7d32; }";
+  html += ".sub-box form { margin-bottom: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }";
+  html += ".dos-prompt { background-color: #000000; color: #00ff00; font-family: 'Courier New', Courier, monospace; ";
+  html += "padding: 15px; border-radius: 5px; height: 250px; overflow-y: auto; white-space: pre-wrap; font-size: 0.9rem; line-height: 1.2; }";
+  html += "</style></head><body>";
+
+  // CAIXA 1
+  html += "<div class='box'>";
+  html += "<h2>1. Status da Estufa</h2>";
+  html += "<div class='sensor-row'>";
+  html += "<div>Temp: <span id='valTemp'>--</span> &deg;C</div>";
+  html += "<div>Umid: <span id='valUmid'>--</span> %</div>";
+  html += "</div>";
+  html += "<div class='clock-row'>";
+  html += "<div>Hora Simulada: <span id='valHora'>--:--</span></div>";
+  html += "<div>Tempo Ligado: <span id='valUptime'>000:00:00</span> <small style='font-size:0.75rem;'>(DDD:HH:MM)</small></div>";
+  html += "</div>";
+  html += "<div class='pin-grid'>";
+  html += "<button id='btnAq' class='pin-btn off' onclick='cliquePino(33)'>Aquecedor<br><small id='txtAq'>INATIVO</small></button>";
+  html += "<button id='btnVen' class='pin-btn off' onclick='cliquePino(32)'>Ventilador<br><small id='txtVen'>INATIVO</small></button>";
+  html += "<button id='btnUm1' class='pin-btn off' onclick='cliquePino(4)'>Umidificador<br><small id='txtUm1'>INATIVO</small></button>";
+  html += "<button id='btnUm2' class='pin-btn off' onclick='cliquePino(14)'>Gatilho Umid.<br><small id='txtUm2'>INATIVO</small></button>";
+  html += "<button id='btnLB1' class='pin-btn off' onclick='cliquePino(27)'>Luz Branca 1<br><small id='txtLB1'>INATIVO</small></button>";
+  html += "<button id='btnLB2' class='pin-btn off' onclick='cliquePino(12)'>Luz Branca 2<br><small id='txtLB2'>INATIVO</small></button>";
+  html += "<button id='btnLVerm' class='pin-btn off' onclick='cliquePino(26)'>Luz Vermelha<br><small id='txtLVerm'>INATIVO</small></button>";
+  html += "<button id='btnLViol' class='pin-btn off' onclick='cliquePino(13)'>Luz Violeta<br><small id='txtLViol'>INATIVO</small></button>";
+  html += "<button id='btnLed' class='pin-btn off' onclick='cliquePino(2)'>Indicador LED<br><small id='txtLed'>INATIVO</small></button>";
+  html += "</div></div>";
+
+  // CAIXA 2
+  html += "<div class='box'>";
+  html += "<h2>2. Monitor Serial</h2>";
+  html += "<div class='dos-prompt' id='dosConsole'></div>";
+  html += "</div>";
+  
+  // CAIXA 3
+  html += "<div class='box'>";
+  html += "<h2>3. Controle de Automação & Configuração</h2>";
+  html += "<div id='boxAutomacao'>Carregando status...</div>";
+  
+  html += "<div class='config-info'>";
+  html += "<div><strong>Perfil Ativo:</strong> <span id='lblPerfil'>--</span></div>";
+  html += "<div><strong>Modo de Iluminação:</strong> <span id='lblModoIlu'>--</span></div>";
+  html += "<div><strong>Duração do Dia:</strong> <span id='lblDurDia'>--</span> h (Ancorado no Meio-Dia)</div>";
+  html += "<div><strong>Temp. Alvo:</strong> <span id='lblTAlvo'>--</span> &deg;C (&plusmn;1.0 &deg;C)</div>";
+  html += "<div><strong>Umid. Mínima:</strong> <span id='lblUMin'>--</span> % (Desliga em <span id='lblUDesl'>--</span> %)</div>";
+  html += "<div><strong>Ciclo Dia/Noite:</strong> <span id='lblCAuto'>--</span></div>";
+  html += "</div>";
+
+  html += "<div style='font-size:0.9rem; font-weight:bold; margin-bottom:5px;'>Perfis Disponíveis:</div>";
+  html += "<div class='profile-btns'>";
+  html += "<button id='btnInc' class='btn-profile' onclick=\"setPerfil('inc')\">Incubação</button>";
+  html += "<button id='btnFrut' class='btn-profile' onclick=\"setPerfil('frut')\">Frutificação</button>";
+  html += "<button id='btnPers' class='btn-profile' onclick=\"setPerfil('pers')\">Personalizado</button>";
+  html += "</div>";
+
+  html += "<div style='font-size:0.9rem; font-weight:bold; margin-bottom:10px;'>Ajuste Manual dos Parâmetros:</div>";
+
+  html += "<div class='input-group'>";
+  html += "<label for='inHora'>Definir hora simulada (HH:MM):</label>";
+  html += "<input type='number' id='inHora' class='time-input' min='0' max='23' placeholder='HH'> : ";
+  html += "<input type='number' id='inMin' class='time-input' min='0' max='59' placeholder='MM'> ";
+  html += "<button id='btnApplyHora' class='btn-action' style='background:#007bff;' onclick='aplicarHora()'>Aplicar Hora</button>";
+  html += "</div>";
+
+  html += "<div class='input-group'>";
+  html += "<label>Ciclo dia e noite simulada:</label>";
+  html += "<button id='btnToggleCiclo' class='btn-action' style='background:#007bff; margin:0;' onclick='toggleCicloAuto()'>--</button>";
+  html += "</div>";
+
+  html += "<div class='input-group'>";
+  html += "<label>Seletor de Modo de Ciclo do Dia:</label>";
+  html += "<button id='btnModoCog' class='btn-profile' onclick=\"setModoIlu('Cogumelos')\">Cogumelos</button>";
+  html += "<button id='btnModoPlan' class='btn-profile' onclick=\"setModoIlu('Plantas')\">Plantas</button>";
+  html += "</div>";
+
+  html += "<div class='input-group'>";
+  html += "<label for='inDur'>Duração do ciclo dia (horas):</label>";
+  html += "<input type='number' id='inDur' step='0.5' min='1.0' max='23.0' placeholder='Ex: 12.0'> ";
+  html += "<button id='btnApplyDur' class='btn-action' style='background:#007bff;' onclick='aplicarDuracao()'>Aplicar Duração</button>";
+  html += "</div>";
+
+  html += "<div class='input-group'>";
+  html += "<label for='inTemp'>Temp. Alvo (&deg;C):</label>";
+  html += "<input type='number' id='inTemp' step='0.5' placeholder='Ex: 22.0'> ";
+  html += "<button id='btnApplyTemp' class='btn-action' style='background:#007bff;' onclick='aplicarTemp()'>Aplicar</button>";
+  html += "</div>";
+  
+  html += "<div class='input-group'>";
+  html += "<label for='inUmid'>Umid. Mínima (%):</label>";
+  html += "<input type='number' id='inUmid' step='1.0' placeholder='Ex: 75'> ";
+  html += "<button id='btnApplyUmid' class='btn-action' style='background:#007bff;' onclick='aplicarUmid()'>Aplicar</button>";
+  html += "</div>";
+
+  html += "<div style='margin-top:15px;'>";
+  html += "<button id='btnReset' class='btn-action' style='background-color:#dc3545;' onclick='restaurarPerfil()'>Restaurar padrão de fábrica</button>";
+  html += "</div>";
+
+  html += "<p id='txtAviso' style='color:#dc3545; font-size:0.85rem; margin-top:10px;'></p>";
+  html += "</div>";
+
+  // CAIXA 4
+  html += "<div class='box'>";
+  html += "<h2>4. Conectividade</h2>";
+  html += "<form action='/set_wifi_mode' method='POST'>";
+  html += "Modo de Operação: <select name='mode' onchange='this.form.submit()'>";
+  html += "<option value='0'" + String(modoWifi == 0 ? " selected" : "") + ">Apenas Ponto de Acesso (AP)</option>";
+  html += "<option value='1'" + String(modoWifi == 1 ? " selected" : "") + ">Cliente Wi-Fi (STA + AP Automático)</option>";
+  html += "</select></form>";
+
+  html += "<div class='sub-box'>";
+  html += "<h4>Configuração AP (ponto de acesso wireless)</h4>";
+  html += "<form action='/set_ap_creds' method='POST'>";
+  html += "SSID AP: <input type='text' name='ssid' value='" + ssidAP + "'> ";
+  html += "Senha AP: <input type='password' name='pass' placeholder='••••••••'> ";
+  html += "<button class='btn-action' style='background:#28a745;' type='submit'>Salvar AP</button>";
+  html += "</form>";
+  html += "</div>";
+
+  html += "<div class='sub-box'>";
+  html += "<h4>Configuração STA (modo Cliente Wi-Fi)</h4>";
+  html += "<form action='/set_sta_creds' method='POST'>";
+  html += "Rede Wi-Fi: <input type='text' name='ssid' value='" + ssidSTA + "'> ";
+  html += "Senha Wi-Fi: <input type='password' name='pass' placeholder='••••••••'> ";
+  html += "<button class='btn-action' style='background:#28a745;' type='submit'>Salvar conexão WLAN</button>";
+  html += "</form>";
+  html += "<p><small>Endereço local em modo Cliente: <b>http://greenhouse-link.local</b></small></p>";
+  html += "</div>";
+
+  html += "<div style='margin-top:15px; border-top:1px solid #eee; padding-top:10px;'>";
+  html += "<button class='btn-action' style='background-color:#ff9800;' onclick='reiniciarESP()'>Reiniciar ESP32</button>";
+  html += "<small style='color:#666;'>Use este botão para aplicar alterações de rede.</small>";
+  html += "</div></div>";
+
+  html += "<script>";
+  html += "function atualizarStatus() {";
+  html += "  fetch('/status').then(r => r.json()).then(d => {";
+  html += "    document.getElementById('valTemp').innerText = d.temp;";
+  html += "    document.getElementById('valUmid').innerText = d.umid;";
+  html += "    document.getElementById('valHora').innerText = d.horaSim;";
+  html += "    document.getElementById('valUptime').innerText = d.uptime;";
+  html += "    document.getElementById('lblPerfil').innerText = d.perfil;";
+  html += "    document.getElementById('lblModoIlu').innerText = d.modoIlu;";
+  html += "    document.getElementById('lblDurDia').innerText = d.durDia;";
+  html += "    document.getElementById('lblTAlvo').innerText = d.tAlvo;";
+  html += "    document.getElementById('lblUMin').innerText = d.uMin;";
+  html += "    document.getElementById('lblUDesl').innerText = (parseFloat(d.uMin) + 5.0).toFixed(1);";
+  html += "    document.getElementById('lblCAuto').innerText = d.cAuto ? 'AUTOMÁTICO' : 'MANUAL';";
+  
+  html += "    let btnC = document.getElementById('btnToggleCiclo');";
+  html += "    btnC.innerText = d.cAuto ? 'AUTOMÁTICO' : 'MANUAL';";
+  html += "    btnC.style.backgroundColor = d.cAuto ? '#28a745' : '#6c757d';";
+
+  html += "    let autoBox = document.getElementById('boxAutomacao');";
+  html += "    let aviso = document.getElementById('txtAviso');";
+  html += "    let lock = d.auto;"; 
+  
+  html += "    if(d.auto) {";
+  html += "      autoBox.innerHTML = \"<p>Estado Atual: <strong style='color:#28a745;'>AUTOMÁTICO (SISTEMA ATIVO)</strong></p><button class='btn-control btn-pause' onclick='toggleAutomacao()'>PAUSAR AUTOMAÇÃO</button>\";";
+  html += "      aviso.innerText = '* Para alterar perfis ou parâmetros manuais, pause a automação primeiro.';";
+  html += "    } else {";
+  html += "      autoBox.innerHTML = \"<p>Estado Atual: <strong style='color:#dc3545;'>PAUSADO (MODO MANUAL / CONFIGURAÇÃO)</strong></p><p><small>* Você pode acionar a Caixa 1 ou alterar as configurações abaixo.</small></p><button class='btn-control btn-resume' onclick='toggleAutomacao()'>RETOMAR AUTOMAÇÃO</button>\";";
+  html += "      aviso.innerText = '';";
+  html += "    }";
+  
+  html += "    document.getElementById('btnInc').className = 'btn-profile' + (d.perfil === 'Incubação' ? ' active' : '');";
+  html += "    document.getElementById('btnFrut').className = 'btn-profile' + (d.perfil === 'Frutificação' ? ' active' : '');";
+  html += "    document.getElementById('btnPers').className = 'btn-profile' + (d.perfil === 'Personalizado' ? ' active' : '');";
+
+  html += "    document.getElementById('btnModoCog').className = 'btn-profile' + (d.modoIlu === 'Cogumelos' ? ' active' : '');";
+  html += "    document.getElementById('btnModoPlan').className = 'btn-profile' + (d.modoIlu === 'Plantas' ? ' active' : '');";
+
+  html += "    document.getElementById('btnInc').disabled = lock;";
+  html += "    document.getElementById('btnFrut').disabled = lock;";
+  html += "    document.getElementById('btnPers').disabled = lock;";
+  html += "    document.getElementById('btnModoCog').disabled = lock;";
+  html += "    document.getElementById('btnModoPlan').disabled = lock;";
+  html += "    document.getElementById('btnToggleCiclo').disabled = lock;";
+  html += "    document.getElementById('btnReset').disabled = lock;";
+  html += "    document.getElementById('btnApplyHora').disabled = lock;";
+  html += "    document.getElementById('btnApplyDur').disabled = lock;";
+  html += "    document.getElementById('btnApplyTemp').disabled = lock;";
+  html += "    document.getElementById('btnApplyUmid').disabled = lock;";
+  html += "    document.getElementById('inTemp').disabled = lock;";
+  html += "    document.getElementById('inUmid').disabled = lock;";
+  html += "    document.getElementById('inHora').disabled = lock;";
+  html += "    document.getElementById('inMin').disabled = lock;";
+  html += "    document.getElementById('inDur').disabled = lock;";
+  
+  html += "    function renderBtn(idBtn, idTxt, ativo, auto) {";
+  html += "      let b = document.getElementById(idBtn);";
+  html += "      let t = document.getElementById(idTxt);";
+  html += "      b.className = 'pin-btn ' + (ativo ? 'on' : 'off') + (auto ? '' : ' clickable');";
+  html += "      t.innerText = (ativo ? 'ATIVO' : 'INATIVO') + (auto ? '' : ' (Clique)');";
+  html += "    }";
+  
+  html += "    renderBtn('btnAq', 'txtAq', d.aq, d.auto);";
+  html += "    renderBtn('btnVen', 'txtVen', d.ven, d.auto);";
+  html += "    renderBtn('btnUm1', 'txtUm1', d.um1, d.auto);";
+  html += "    renderBtn('btnUm2', 'txtUm2', d.um2, d.auto);";
+  html += "    renderBtn('btnLB1', 'txtLB1', d.lB1, d.auto);";
+  html += "    renderBtn('btnLVerm', 'txtLVerm', d.lVerm, d.auto);";
+  html += "    renderBtn('btnLB2', 'txtLB2', d.lB2, d.auto);";
+  html += "    renderBtn('btnLViol', 'txtLViol', d.lViol, d.auto);";
+  html += "    renderBtn('btnLed', 'txtLed', d.led, d.auto);";
+
+  html += "    let consoleDiv = document.getElementById('dosConsole');";
+  html += "    let rolar = (consoleDiv.scrollHeight - consoleDiv.clientHeight <= consoleDiv.scrollTop + 20);";
+  html += "    consoleDiv.innerText = d.log;";
+  html += "    if(rolar) consoleDiv.scrollTop = consoleDiv.scrollHeight;";
+  html += "  });";
+  html += "}";
+
+  html += "function toggleAutomacao() { fetch('/toggleAutomacao').then(() => atualizarStatus()); }";
+  html += "function cliquePino(p) { fetch('/togglePino?pin=' + p).then(() => atualizarStatus()); }";
+  html += "function setPerfil(p) { fetch('/setPerfil?p=' + p).then(() => atualizarStatus()); }";
+  html += "function toggleCicloAuto() { fetch('/toggleCicloAuto').then(() => atualizarStatus()); }";
+  html += "function setModoIlu(m) { fetch('/setModoIlu?m=' + m).then(() => atualizarStatus()); }";
+
+  html += "function aplicarTemp() {";
+  html += "  let t = document.getElementById('inTemp').value;";
+  html += "  if(t !== '') fetch('/setTempAlvo?t=' + t).then(() => { document.getElementById('inTemp').value = ''; atualizarStatus(); });";
+  html += "}";
+
+  html += "function aplicarUmid() {";
+  html += "  let u = document.getElementById('inUmid').value;";
+  html += "  if(u !== '') fetch('/setUmidMin?u=' + u).then(() => { document.getElementById('inUmid').value = ''; atualizarStatus(); });";
+  html += "}";
+
+  html += "function restaurarPerfil() {";
+  html += "  if(confirm('Restaurar o perfil ativo para as configurações de fábrica?')) {";
+  html += "    fetch('/restaurarPerfil').then(() => atualizarStatus());";
+  html += "  }";
+  html += "}";
+
+  html += "function aplicarHora() {";
+  html += "  let h = document.getElementById('inHora').value;";
+  html += "  let m = document.getElementById('inMin').value;";
+  html += "  if(h !== '' && m !== '') fetch('/setHora?h=' + h + '&m=' + m).then(() => { document.getElementById('inHora').value=''; document.getElementById('inMin').value=''; atualizarStatus(); });";
+  html += "}";
+
+  html += "function aplicarDuracao() {";
+  html += "  let d = document.getElementById('inDur').value;";
+  html += "  if(d !== '') fetch('/setDuracaoDia?d=' + d).then(() => { document.getElementById('inDur').value=''; atualizarStatus(); });";
+  html += "}";
+
+  html += "function reiniciarESP() {";
+  html += "  if(confirm('Tem certeza de que deseja reiniciar o ESP32?')) {";
+  html += "    fetch('/restart').then(() => alert('Comando de reinicialização enviado! Aguarde alguns instantes.'));";
+  html += "  }";
+  html += "}";
+
+  html += "setInterval(atualizarStatus, 3000);";
+  html += "atualizarStatus();";
+  html += "</script>";
+
+  html += "</body></html>";
+  server.send(200, "text/html", html);
 }
 
 void processarIluminacao() {
@@ -954,12 +704,12 @@ void processarIluminacao() {
     if (horaSimulada >= 6 && horaSimulada < 18) {
       if (digitalRead(LUZ_BRANCA1) == HIGH) {
         digitalWrite(LUZ_BRANCA1, LOW);
-        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Dia iniciado (ciclo Cogumelos 06:00 - 18:00). Luz Branca 1 LIGADA!");
+        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Dia iniciado (ciclo Cogumelos) (06:00 - 18:00). Luz Branca 1 LIGADA!");
       }
     } else {
       if (digitalRead(LUZ_BRANCA1) == LOW) {
         digitalWrite(LUZ_BRANCA1, HIGH);
-        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Noite iniciada (ciclo Cogumelos 18:00 - 06:00). Luz Branca 1 DESLIGADA.");
+        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Noite iniciada (ciclo Cogumelos). Luz Branca 1 DESLIGADA.");
       }
     }
   } else if (modoIluminacao == "Plantas") {
@@ -994,7 +744,7 @@ void processarIluminacao() {
 
 void setup() {
   Serial.begin(115200);
-  delay(3000);
+  delay(1000);
 
   pinMode(LED_BUILTIN_PIN, OUTPUT);
   pinMode(BTN_RESET, INPUT_PULLUP);
@@ -1018,21 +768,8 @@ void setup() {
   digitalWrite(LUZ_BRANCA2, HIGH);
   digitalWrite(LUZ_VIOLETA, HIGH);
 
-  logMessage("[GREENHOUSE] Sistema iniciado v3.0...");
+  logMessage("[GREENHOUSE] Sistema iniciado...");
   dht.begin();
-
-// Coleta de dados de cabeçalho do usuário
-const char * headerkeys[] = {"User-Agent"};
-server.collectHeaders(headerkeys, 1);
-
-// Carregar senha salva na memória
-prefs.begin("greenhouse", true);
-senhaSistema = prefs.getString("sys_pass", "123456");
-prefs.end();
-
-// registro de rotas do login
-server.on("/login", HTTP_POST, handleLogin);
-server.on("/set_sys_pass", HTTP_POST, handleSetSysPass);
 
   carregarConfiguracoesRede();
 
@@ -1042,15 +779,16 @@ server.on("/set_sys_pass", HTTP_POST, handleSetSysPass);
 
   carregarPerfil(savedPerfil);
 
-  WiFi.persistent(false); 
+  // Inicialização Wi-Fi
+  WiFi.persistent(false); // Desabilita gravações repetitivas no Flash do ESP32
   
   if (modoWifi == 0) {
     WiFi.mode(WIFI_AP);
-    WiFi.softAP(ssidAP.c_str(), passAP.c_str(), 1); 
+    WiFi.softAP(ssidAP.c_str(), passAP.c_str(), 1); // Força Canal 1 para estabilidade
     logMessage("[GREENHOUSE] Modo Apenas AP Ativo. IP: " + WiFi.softAPIP().toString());
   } else {
     WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(ssidAP.c_str(), passAP.c_str(), 1); 
+    WiFi.softAP(ssidAP.c_str(), passAP.c_str(), 1); // Canal 1 fixo
     logMessage("[GREENHOUSE] AP de Emergência Habilitado: " + ssidAP + " (IP: " + WiFi.softAPIP().toString() + ")");
 
     if (ssidSTA.length() > 0) {
@@ -1068,7 +806,6 @@ server.on("/set_sys_pass", HTTP_POST, handleSetSysPass);
 
   server.on("/", handleRoot);
   server.on("/status", handleStatus);
-  server.on("/log", handleLog);
   server.on("/toggleAutomacao", handleToggleAutomacao);
   server.on("/togglePino", handleTogglePino);
   server.on("/setPerfil", handleSetPerfil);
@@ -1090,15 +827,6 @@ server.on("/set_sys_pass", HTTP_POST, handleSetSysPass);
 }
 
 void loop() {
-// Sincronização periódica NTP a cada 24 horas
-tempoAtual = millis();
-if (WiFi.status() == WL_CONNECTED) {
-  if (tempoUltimoNTP == 0 || (tempoAtual - tempoUltimoNTP >= INTERVALO_NTP)) {
-    tempoUltimoNTP = tempoAtual;
-    sincronizarNTP();
-  }
-}
-
   if (digitalRead(BTN_RESET) == LOW) {
     Serial.println("[RESET] Botão BOOT detectado. Mantenha pressionado por 5s para Reset...");
     unsigned long tPress = millis();
@@ -1140,6 +868,7 @@ if (WiFi.status() == WL_CONNECTED) {
         tentandoConectarWifi = false;
         tempoUltimaTentativaWifi = tempoAtual;
         
+        // Interrompe a varredura do rádio para travar o canal do SoftAP
         WiFi.disconnect(false);
         WiFi.mode(WIFI_AP_STA);
         WiFi.softAP(ssidAP.c_str(), passAP.c_str(), 1);
@@ -1153,14 +882,16 @@ if (WiFi.status() == WL_CONNECTED) {
       }
     } else {
       if (WiFi.status() == WL_CONNECTED) {
-        // Conexão estável
+        // Conexão estável em STA
       } else {
+        // Se perdeu a conexão ou expirou o tempo de espera
         if (WiFi.getMode() != WIFI_AP_STA && WiFi.getMode() != WIFI_AP) {
           WiFi.mode(WIFI_AP_STA);
           WiFi.softAP(ssidAP.c_str(), passAP.c_str(), 1);
           logMessage("[REDE] Conexão LAN perdida! AP de emergência reativado.");
         }
 
+        // Tenta reconectar a cada 5 minutos
         if (tempoUltimaTentativaWifi == 0 || (tempoAtual - tempoUltimaTentativaWifi >= INTERVALO_RECONEXAO_WIFI)) {
           if (ssidSTA.length() > 0) {
             logMessage("[REDE] Tentando reconectar à rede Wi-Fi (" + ssidSTA + ")...");
@@ -1251,13 +982,13 @@ if (WiFi.status() == WL_CONNECTED) {
         precisaUmidificar = true;
       } else if (umidadeAtual >= (umidMinima + 5.0)) {
         if (precisaUmidificar) {
-          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Umid. Reestabelecida. Umidificador DESL.");
+          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Umid. Reestabelecida. Umidificador DESLIGADO.");
           precisaUmidificar = false;
           digitalWrite(RELE_UMIDADE_1, HIGH);
           digitalWrite(RELE_UMIDADE_2, HIGH);
           etapaUmidade = 0; 
         } else if (digitalRead(RELE_UMIDADE_1) == LOW) {
-          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Umid. OK. Umidificador DESL.");
+          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Umid. OK. Umidificador DESLIGADO.");
           digitalWrite(RELE_UMIDADE_1, HIGH);
           digitalWrite(RELE_UMIDADE_2, HIGH);
           etapaUmidade = 0;
