@@ -3,79 +3,93 @@
 #include <ESPmDNS.h>
 #include <DHT.h>
 #include <Preferences.h>
-// Configurações de NTP (sincronia da hora simulada com real)
+#include <Wire.h>
+#include <SparkFun_SCD30_Arduino_Library.h>
+// Configurações de NTP
 const char* ntpServer = "a.st1.ntp.br"; 
 const long gmtOffset_sec = -10800;       
 const int daylightOffset_sec = 0;
 unsigned long tempoUltimoNTP = 0;
 const unsigned long INTERVALO_NTP = 864000000; 
+bool leituraSucesso = false;
+//
 WebServer server(80);
 Preferences prefs;
-//pino dos sensores
-#define DHTPIN           25   
-// Pinos diretos na placa
+// Pinos da Estufa
 #define LED_BUILTIN_PIN 2     
-#define BTN_RESET       0    
-// Controle do ambiente
+#define BTN_RESET        0    
 #define RELE_AQUECIMENTO 33   
 #define RELE_VENTILADOR  32   
 #define RELE_UMIDADE_1   4    
 #define RELE_UMIDADE_2   14   
-// Módulos de Iluminação Espectral
+#define RELE_REFRIGERACAO 16 // pino RX2
+#define RELE_INJECAO_CO2 17 // pino TX2
+// Pinos de Iluminação Progressiva
 #define LUZ_BRANCA1      27   
 #define LUZ_VERMELHA     26   
 #define LUZ_BRANCA2      12   
 #define LUZ_VIOLETA      13   
-// Escolhe o sensor DHT da biblioteca
+// Sensores
+#define DHTPIN           25   
 #define DHTTYPE          DHT11
 DHT dht(DHTPIN, DHTTYPE);
-// Parâmetros wifi e rede-senha inicial 
+SCD30 airSensor;
+bool usaDHT11 = false;
+bool usaSCD30 = false;
+static unsigned long tempoSensor = 0;
+static unsigned long tempoLogSensor = 0;
+// Parâmetros de Conectividade salvos na memória (NVS)
 int modoWifi = 0;              
-String ssidAP = "Greenhouse_link";
-String passAP = "Conecta!";
+String ssidAP = "Greenhouse_link"; // nome de rede AP inicial
+String passAP = "Conecta!";        // senha da rede AP inicial
 String ssidSTA = "";
 String passSTA = "";
-// Segurança e Senha de Acesso de fábrica
+// Segurança e Senha de Acesso
 String senhaAcesso = "123456";
 bool configuracoesDesbloqueadas = false;
-// Variáveis do bloco do Wi-Fi
+// Controle Não-Bloqueante do Wi-Fi
 bool tentandoConectarWifi = false;
 unsigned long tempoInicioConexaoWifi = 0;
 unsigned long tempoUltimaTentativaWifi = 0;
 unsigned long tempoBlinkWifi = 0;
 const unsigned long TIMEOUT_CONEXAO_WIFI = 20000;   
 const unsigned long INTERVALO_RECONEXAO_WIFI = 300000; 
-// Parâmetros de configuração do ambiente
+// Parâmetros iniciais da Estufa
 String perfilAtivo = "Frutificação";
-float tempAlvo = 18.0; 
-float umidMinima = 90.0; 
-bool cicloAuto = true; 
-const float TEMP_MARGEM = 1.0;       
-// Modo de iluminação inicial
+float tempAlvo = 18.0;      // Temperatura que desativa atuadores ao ser alcançada
+float umidMinima = 90.0;    // umidade que aciona umidificador 
+float umidIdeal = 5.0;      // Margem de umidade acima do mínimo para desligar
+float tempMargem = 1.0;     // Margem/histerese de temperatura ajustável
+float co2Alvo = 1000;       // Valor padrão desejado em ppm
+float co2Margem = 700;      // Margem de oscilação em ppm
+bool cicloAuto = true;      
 String modoIluminacao = "Cogumelos"; 
 float duracaoDia = 12.0;             
-// parâmetros do Relógio
+// Parâmetros do Relógio
 int horaSimulada = 6;
 int minutoSimulado = 0;
 unsigned long tempoRelogio = 0;
 unsigned long tempoAtual = 0;
-// Variáveis Globais de status
+// Variáveis Globais de Estado
 bool automacaoAtiva = true;   
 unsigned long tempoLed = 0;
 bool estadoLed = false;
 float temperaturaAtual = 0;
 float umidadeAtual = 0;
+float co2Atual = 0;          // Leitura de CO2 do SCD30
+// Variáveis do atuador de comparação da leitura
 bool precisaUmidificar = false;
 int etapaUmidade = 0; 
+bool estadoVentilar = false;
+bool estadoInjecaoCO2 = false;
 unsigned long cronometroUmidade = 0;
-// Buffer do monitor serial web
+// Buffer do monitor serial e captura de informações para log
 String serialBuffer = "";
 const size_t MAX_BUFFER_SIZE = 5000;
-// Função auxiliar para capturar detalhes do cliente (IP e User-Agent)
 String getClientDetails() {
   return " [IP: " + server.client().remoteIP().toString() + " | UA: " + server.header("User-Agent") + "]";
 }
-// Bloco referente a mensagem de log web
+//
 void logMessage(String msg) {
   Serial.println(msg);
   serialBuffer += msg + "\n";
@@ -83,8 +97,7 @@ void logMessage(String msg) {
     serialBuffer = serialBuffer.substring(serialBuffer.length() - MAX_BUFFER_SIZE);
   }
 }
-// Cronometro de tempo ligado
-String getUptimeString() {
+String getUptimeString() { // matemática do tempo ligado
   unsigned long totalSegundos = millis() / 1000;
   unsigned long dias = totalSegundos / 86400;
   unsigned long horas = (totalSegundos % 86400) / 3600;
@@ -93,13 +106,11 @@ String getUptimeString() {
   snprintf(relogio, sizeof(relogio), "%03lu:%02lu:%02lu", dias, horas, minutos);
   return String(relogio);
 }
-// Relógio da hora simulada
 String getHoraSimuladaString() {
   char buf[10];
   snprintf(buf, sizeof(buf), "%02d:%02d", horaSimulada, minutoSimulado);
   return String(buf);
 }
-// Sistema de iluminação progressiva das plantas em 4 canais
 void processarIluminacao() {
   if (!cicloAuto) return; 
   if (modoIluminacao == "Cogumelos") {
@@ -135,7 +146,6 @@ void processarIluminacao() {
       bool b1   = (mCurr >= (mStart + p4))  && (mCurr < (mEnd - p4));
       bool b2   = (mCurr >= (mStart + p10)) && (mCurr < (mEnd - p10));
       bool viol = (mCurr >= (720 - p10))    && (mCurr < (720 + p10));
-      
       if (digitalRead(LUZ_BRANCA1) != (b1 ? LOW : HIGH)) {
         digitalWrite(LUZ_BRANCA1, b1 ? LOW : HIGH);
         logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Luz Branca 1 " + (b1 ? "LIGADA" : "DESLIGADA") + " (ciclo Plantas).");
@@ -155,7 +165,7 @@ void processarIluminacao() {
     }
   }
 }
-//carrega as configurações de rede salvas na memória
+// Sequência blocos memória
 void carregarConfiguracoesRede() {
   prefs.begin("greenhouse", true);
   modoWifi = prefs.getInt("modo_wifi", 0);
@@ -166,117 +176,137 @@ void carregarConfiguracoesRede() {
   senhaAcesso = prefs.getString("senha_acesso", "123456");
   prefs.end();
 }
-// Carga inicial de configuração com valores salvos
 void carregarPerfil(String perfil) {
   prefs.begin("greenhouse", true);
   if (perfil == "Incubação") {
     tempAlvo = prefs.getFloat("inc_t", 22.0);
     umidMinima = prefs.getFloat("inc_u", 65.0);
     cicloAuto = prefs.getBool("inc_c", false);
+    co2Alvo = prefs.getFloat("inc_co", 1000.0);
   } else if (perfil == "Frutificação") {
     tempAlvo = prefs.getFloat("frut_t", 18.0);
     umidMinima = prefs.getFloat("frut_u", 90.0);
     cicloAuto = prefs.getBool("frut_c", true);
+    co2Alvo = prefs.getFloat("frut_co", 1500.0);
   } else if (perfil == "Personalizado") {
     tempAlvo = prefs.getFloat("pers_t", 20.0);
     umidMinima = prefs.getFloat("pers_u", 75.0);
     cicloAuto = prefs.getBool("pers_c", true);
-  }
+    co2Alvo = prefs.getFloat("pers_co", 800.0);
+  } 
+  umidIdeal = prefs.getFloat("umid_ideal", 5.0);
+  tempMargem = prefs.getFloat("temp_margem", 1.0);
   modoIluminacao = prefs.getString("modo_ilu", "Cogumelos");
   duracaoDia = prefs.getFloat("dur_dia", 12.0);
+  co2Margem = prefs.getFloat("margem_co2", 500.0);
   prefs.end();
   perfilAtivo = perfil;
-  // mantém reação instantânea da iluminação a nova configuração
-  if (automacaoAtiva) processarIluminacao();
 }
-// Salva variáveis no perfil em uso/ativo
-void salvarPerfilAtivo(float t, float u, bool c) {
+void salvarPerfilAtivo(float t, float u, bool c, float co) {
   prefs.begin("greenhouse", false);
   if (perfilAtivo == "Incubação") {
     prefs.putFloat("inc_t", t);
     prefs.putFloat("inc_u", u);
     prefs.putBool("inc_c", c);
+    prefs.putFloat("inc_co", co);
   } else if (perfilAtivo == "Frutificação") {
     prefs.putFloat("frut_t", t);
     prefs.putFloat("frut_u", u);
     prefs.putBool("frut_c", c);
+    prefs.putFloat("frut_co", co);
   } else if (perfilAtivo == "Personalizado") {
     prefs.putFloat("pers_t", t);
     prefs.putFloat("pers_u", u);
     prefs.putBool("pers_c", c);
-  }  
+    prefs.putFloat("pers_co", co);
+  } 
+  prefs.putFloat("umid_ideal", umidIdeal);
+  prefs.putFloat("temp_margem", tempMargem);
   prefs.putString("modo_ilu", modoIluminacao);
   prefs.putFloat("dur_dia", duracaoDia);
+  prefs.putFloat("margem_co2", co2Margem);
   prefs.putString("perfil_ativo", perfilAtivo);
   prefs.end();
-  //coloca os valores que foram salvos na aplicaçaõ de rotina
   tempAlvo = t;
   umidMinima = u;
   cicloAuto = c;
-  // mantém reação instantânea da iluminação a nova configuração
-  if (automacaoAtiva) processarIluminacao();
+  co2Alvo = co;
 }
-// restaura valores de configuração apenas para o perfil ativo
+void salvarParametrosGeraisPerfil() {
+  prefs.begin("greenhouse", false);
+  prefs.putFloat("umid_ideal", umidIdeal);
+  prefs.putFloat("temp_margem", tempMargem);
+  prefs.end();
+}
 void restaurarFabricaPerfilAtivo() {
   prefs.begin("greenhouse", false);
   if (perfilAtivo == "Incubação") {
-    prefs.putFloat("inc_t", 22.0);
-    prefs.putFloat("inc_u", 65.0);
+    prefs.putFloat("inc_t", 22.0); 
+    prefs.putFloat("inc_u", 65.0); 
     prefs.putBool("inc_c", false);
-    tempAlvo = 22.0; umidMinima = 65.0; cicloAuto = false;
+    prefs.putFloat("inc_co", 1000.0); // Chave corrigida
+    tempAlvo = 22.0; umidMinima = 65.0; cicloAuto = false; co2Alvo = 1000;
   } else if (perfilAtivo == "Frutificação") {
-    prefs.putFloat("frut_t", 18.0);
-    prefs.putFloat("frut_u", 90.0);
+    prefs.putFloat("frut_t", 18.0); 
+    prefs.putFloat("frut_u", 90.0); 
     prefs.putBool("frut_c", true);
-    tempAlvo = 18.0; umidMinima = 90.0; cicloAuto = true;
+    prefs.putFloat("frut_co", 1500.0); // Chave corrigida
+    tempAlvo = 18.0; umidMinima = 90.0; cicloAuto = true; co2Alvo = 1500;
   } else if (perfilAtivo == "Personalizado") {
-    prefs.putFloat("pers_t", 20.0);
-    prefs.putFloat("pers_u", 75.0);
+    prefs.putFloat("pers_t", 20.0); 
+    prefs.putFloat("pers_u", 75.0); 
     prefs.putBool("pers_c", true);
-    tempAlvo = 20.0; umidMinima = 75.0; cicloAuto = true;
+    prefs.putFloat("pers_co", 800.0);
+    tempAlvo = 20.0; umidMinima = 75.0; cicloAuto = true; co2Alvo = 800;
   }
+  umidIdeal = 5.0;
+  tempMargem = 1.0;
   modoIluminacao = "Cogumelos";
   duracaoDia = 12.0;
+  co2Margem = 500;
+  prefs.putFloat("umid_ideal", umidIdeal);
+  prefs.putFloat("temp_margem", tempMargem);
   prefs.putString("modo_ilu", modoIluminacao);
   prefs.putFloat("dur_dia", duracaoDia);
+  prefs.putFloat("margem_co2", co2Margem);
   prefs.end();
-  // mantém reação instantânea da iluminação a nova configuração
-  if (automacaoAtiva) processarIluminacao();
 }
-// Não sei o que isso faz (ainda)
-void handleStatus() {
-  String json = "{";
-  json += "\"temp\":\"" + String(temperaturaAtual, 1) + "\",";
-  json += "\"umid\":\"" + String(umidadeAtual, 1) + "\",";
-  json += "\"horaSim\":\"" + getHoraSimuladaString() + "\",";
-  json += "\"uptime\":\"" + getUptimeString() + "\",";
-  json += "\"tAlvo\":\"" + String(tempAlvo, 1) + "\",";
-  json += "\"uMin\":\"" + String(umidMinima, 1) + "\",";
-  json += "\"perfil\":\"" + perfilAtivo + "\",";
-  json += "\"modoIlu\":\"" + modoIluminacao + "\",";
-  json += "\"durDia\":\"" + String(duracaoDia, 1) + "\",";
-  json += "\"cAuto\":" + String(cicloAuto ? "true" : "false") + ",";
-  json += "\"auto\":" + String(automacaoAtiva ? "true" : "false") + ",";
-  json += "\"unlocked\":" + String(configuracoesDesbloqueadas ? "true" : "false") + ",";
-  json += "\"aq\":" + String(digitalRead(RELE_AQUECIMENTO) == LOW ? "true" : "false") + ",";
-  json += "\"ven\":" + String(digitalRead(RELE_VENTILADOR) == LOW ? "true" : "false") + ",";
-  json += "\"um1\":" + String(digitalRead(RELE_UMIDADE_1) == LOW ? "true" : "false") + ",";
-  json += "\"um2\":" + String(digitalRead(RELE_UMIDADE_2) == LOW ? "true" : "false") + ",";
-  json += "\"lB1\":" + String(digitalRead(LUZ_BRANCA1) == LOW ? "true" : "false") + ",";
-  json += "\"lVerm\":" + String(digitalRead(LUZ_VERMELHA) == LOW ? "true" : "false") + ",";
-  json += "\"lB2\":" + String(digitalRead(LUZ_BRANCA2) == LOW ? "true" : "false") + ",";
-  json += "\"lViol\":" + String(digitalRead(LUZ_VIOLETA) == LOW ? "true" : "false") + ",";
-  json += "\"led\":" + String(digitalRead(LED_BUILTIN_PIN) == HIGH ? "true" : "false") + ",";
-  String logEscaped = serialBuffer;
-  logEscaped.replace("\\", "\\\\");
-  logEscaped.replace("\"", "\\\"");
-  logEscaped.replace("\n", "\\n");
-  logEscaped.replace("\r", "");
-  json += "\"log\":\"" + logEscaped + "\"";
-  json += "}"; 
-  server.send(200, "application/json", json);
+void handleSetPerfil() {
+  if (configuracoesDesbloqueadas && server.hasArg("p")) {
+    String p = server.arg("p");
+    String novoPerfil = "";
+    if (p == "inc") novoPerfil = "Incubação";
+    else if (p == "frut") novoPerfil = "Frutificação";
+    else if (p == "pers") novoPerfil = "Personalizado";
+    if (novoPerfil != "") {
+      carregarPerfil(novoPerfil); // Carrega o perfil salvo da memória
+      prefs.begin("greenhouse", false);
+      prefs.putString("perfil_ativo", novoPerfil);
+      prefs.end();
+      logMessage("[CONFIG] Perfil alterado para " + perfilAtivo + getClientDetails());
+    }
+  }
+  server.send(200, "text/plain", "OK");
 }
-// Parte do sistema de bloqueio de configurações
+// Handlers de Segurança & Configuração
+void handleSetSenha() {
+  if (configuracoesDesbloqueadas && server.hasArg("pass")) {
+    String novaPass = server.arg("pass");
+    if (novaPass.length() >= 4) {
+      senhaAcesso = novaPass;
+      prefs.begin("greenhouse", false);
+      prefs.putString("senha_acesso", senhaAcesso);
+      prefs.end();
+      logMessage("[SEGURANÇA] Senha de acesso alterada com sucesso." + getClientDetails());
+      server.send(200, "text/plain", "OK");
+    } else {
+      logMessage("[SEGURANÇA] [ERRO] A nova senha deve ter pelo menos 4 caracteres." + getClientDetails());
+      server.send(400, "text/plain", "Senha curta");
+    }
+  } else {
+    server.send(403, "text/plain", "Acesso Negado");
+  }
+}
 void handleDesbloquear() {
   if (server.hasArg("pass")) {
     String p = server.arg("pass");
@@ -293,33 +323,23 @@ void handleDesbloquear() {
     server.send(400, "text/plain", "Bad Request");
   }
 }
-//identifica quem bloqueia configurações
 void handleBloquear() {
   configuracoesDesbloqueadas = false;
   automacaoAtiva = true;
+  processarIluminacao();
   logMessage("[SEGURANÇA] Configurações bloqueadas manualmente." + getClientDetails());
   server.send(200, "text/plain", "OK");
 }
-// Altera senha de desbloqueio
-void handleSetSenha() {
-  if (configuracoesDesbloqueadas && server.hasArg("pass")) {
-    String novaPass = server.arg("pass");
-    if (novaPass.length() >= 4) {
-      senhaAcesso = novaPass;
-      prefs.begin("greenhouse", false);
-      prefs.putString("senha_acesso", senhaAcesso);
-      prefs.end();
-      logMessage("[SEGURANÇA] Senha de acesso alterada com sucesso." + getClientDetails());
-      server.send(200, "text/plain", "OK");
-    } else {
-      logMessage("[SEGURANÇA] ERRO: A nova senha deve ter pelo menos 4 caracteres." + getClientDetails());
-      server.send(400, "text/plain", "Senha curta");
-    }
-  } else {
-    server.send(403, "text/plain", "Acesso Negado");
+// Comando do ciclo de iluminação
+void handleToggleCicloAuto() {
+  if (configuracoesDesbloqueadas) {
+    cicloAuto = !cicloAuto;
+    salvarPerfilAtivo(tempAlvo, umidMinima, cicloAuto, co2Alvo);
+    logMessage("[CONFIG] Ciclo Dia/Noite do perfil " + perfilAtivo + " alterado para: " + String(cicloAuto ? "AUTOMÁTICO" : "MANUAL") + getClientDetails());
   }
+  server.send(200, "text/plain", "OK");
 }
-// Comando dos pinos via WEB condensados
+// Comando manual dos pinos genéricos
 void handleTogglePino() {
   if (configuracoesDesbloqueadas && server.hasArg("pin")) {
     int pin = server.arg("pin").toInt();
@@ -329,27 +349,8 @@ void handleTogglePino() {
   }
   server.send(200, "text/plain", "OK");
 }
-// Atuador de ajuste de perfil pelo comando WEB
-void handleSetPerfil() {
-  if (configuracoesDesbloqueadas && server.hasArg("p")) {
-    String p = server.arg("p");
-    if (p == "inc") carregarPerfil("Incubação");
-    else if (p == "frut") carregarPerfil("Frutificação");
-    else if (p == "pers") carregarPerfil("Personalizado");
-    logMessage("[CONFIG] Perfil alterado para " + perfilAtivo + getClientDetails());
-  }
-  server.send(200, "text/plain", "OK");
-}
-// Atuador de ativação do ciclo de iluminação (também salva outras configs, precisa verificar e separar)
-void handleToggleCicloAuto() {
-  if (configuracoesDesbloqueadas) {
-    cicloAuto = !cicloAuto;
-    salvarPerfilAtivo(tempAlvo, umidMinima, cicloAuto);
-    logMessage("[CONFIG] Ciclo Dia/Noite do perfil " + perfilAtivo + " alterado para: " + String(cicloAuto ? "AUTOMÁTICO" : "MANUAL") + getClientDetails());
-  }
-  server.send(200, "text/plain", "OK");
-}
-// Seletor de modo de luz plantas ou cogumelos
+// Configurações do ambiente e rotina
+// Ciclo dia e noite
 void handleSetModoIluminacao() {
   if (configuracoesDesbloqueadas && server.hasArg("m")) {
     String m = server.arg("m");
@@ -363,7 +364,6 @@ void handleSetModoIluminacao() {
   }
   server.send(200, "text/plain", "OK");
 }
-// Ajuste de duração do dia das plantas (cogumelos fixo em luz B1 12h)
 void handleSetDuracaoDia() {
   if (configuracoesDesbloqueadas && server.hasArg("d")) {
     float d = server.arg("d").toFloat();
@@ -379,13 +379,13 @@ void handleSetDuracaoDia() {
   }
   server.send(200, "text/plain", "OK");
 }
-// Ajuste da temperatura alvo (desliga aquecimento ou ventilação)
+// Configuração de temperatura
 void handleSetTempAlvo() {
   if (configuracoesDesbloqueadas && server.hasArg("t")) {
     float nTemp = server.arg("t").toFloat();
     if (nTemp >= 9.0 && nTemp <= 48.0) {
       tempAlvo = nTemp;
-      salvarPerfilAtivo(tempAlvo, umidMinima, cicloAuto);
+      salvarPerfilAtivo(tempAlvo, umidMinima, cicloAuto, co2Alvo);
       logMessage("[CONFIG] Temperatura Alvo alterada para " + String(tempAlvo, 1) + "ºC no perfil " + perfilAtivo + getClientDetails());
     } else {
       logMessage("[ERRO] Temperatura fora dos limites de segurança (9ºC a 48ºC)!" + getClientDetails());
@@ -393,29 +393,74 @@ void handleSetTempAlvo() {
   }
   server.send(200, "text/plain", "OK");
 }
-// Ajuste da umidade mínima (liga umidificador)
-void handleSetUmidMin() {
-  if (configuracoesDesbloqueadas && server.hasArg("u")) {
-    float nUmid = server.arg("u").toFloat();
-    if (nUmid >= 10.0 && nUmid <= 90.0) {
-      umidMinima = nUmid;
-      salvarPerfilAtivo(tempAlvo, umidMinima, cicloAuto);
-      logMessage("[CONFIG] Umidade Mínima alterada para " + String(umidMinima, 1) + "% no perfil " + perfilAtivo + getClientDetails());
+void handleSetTempMargem() {
+  if (configuracoesDesbloqueadas && server.hasArg("tm")) {
+    float nTm = server.arg("tm").toFloat();
+    if (nTm >= 0.1 && nTm <= 5.0) {
+      tempMargem = nTm;
+      salvarParametrosGeraisPerfil();
+      logMessage("[CONFIG] Margem de Temperatura (Histerese) alterada para ±" + String(tempMargem, 1) + "ºC" + getClientDetails());
     } else {
-      logMessage("[ERRO] Umidade fora dos limites de segurança (10% a 90%)!" + getClientDetails());
+      logMessage("[ERRO] Margem de temperatura fora dos limites (0.1ºC a 5.0ºC)!" + getClientDetails());
     }
   }
   server.send(200, "text/plain", "OK");
 }
-// Restaurar padrão de fabrica no perfil ativo
-void handleRestaurarPerfil() {
-  if (configuracoesDesbloqueadas) {
-    restaurarFabricaPerfilAtivo();
-    logMessage("[CONFIG] Padrões de fábrica restaurados para o perfil " + perfilAtivo + getClientDetails());
+// Configuração do ajuste de CO2
+void handleSetco2Alvo() {
+  if (configuracoesDesbloqueadas && server.hasArg("co")) {
+    float nco2Alvo = server.arg("co").toFloat();
+    if (nco2Alvo >= 600.0 && nco2Alvo <= 2500.0) {
+      co2Alvo = nco2Alvo;
+      salvarPerfilAtivo(tempAlvo, umidMinima, cicloAuto, co2Alvo);
+      logMessage("[CONFIG] CO² Alvo alterada para " + String(co2Alvo, 1) + "ppm no perfil " + perfilAtivo + getClientDetails());
+    } else {
+      logMessage("[ERRO] CO² fora dos limites de segurança (600 ppm a 2500 ppm)!" + getClientDetails());
+    }
   }
   server.send(200, "text/plain", "OK");
 }
-// Ajuste da hora simulada (relógio)
+void handleSetco2Margem() {
+  if (configuracoesDesbloqueadas && server.hasArg("com")) {
+    float nco2m = server.arg("com").toFloat();
+    if (nco2m >= 100.0 && nco2m <= 1000.0) {
+      co2Margem = nco2m;
+      salvarParametrosGeraisPerfil();
+      logMessage("[CONFIG] Margem de CO² (Histerese) alterada para ±" + String(co2Margem, 1) + "ppm." + getClientDetails());
+    } else {
+      logMessage("[ERRO] Margem de CO² fora dos limites (100 ppm a 1000)!" + getClientDetails());
+    }
+  }
+  server.send(200, "text/plain", "OK");
+}
+// Configuração umidade
+void handleSetUmidMin() {
+  if (configuracoesDesbloqueadas && server.hasArg("u")) {
+    float nUmid = server.arg("u").toFloat();
+    if ((nUmid + umidIdeal) <= 95.0 && nUmid >= 10.0 && nUmid <= 94.0) {
+      umidMinima = nUmid;
+      salvarPerfilAtivo(tempAlvo, umidMinima, cicloAuto, co2Alvo);
+      logMessage("[CONFIG] Umidade Mínima alterada para " + String(umidMinima, 1) + "% no perfil " + perfilAtivo + getClientDetails());
+    } else {
+      logMessage("[ERRO] Umidade fora dos limites de segurança (mínimo 10% a mínima + margem = 94%)!" + getClientDetails());
+    }
+  }
+  server.send(200, "text/plain", "OK");
+}
+void handleSetUmidIdeal() {
+  if (configuracoesDesbloqueadas && server.hasArg("ui")) {
+    float nUi = server.arg("ui").toFloat();
+    if ((umidMinima + nUi) <= 95.0 && nUi >= 0.0 && nUi <= 30.0) {
+      umidIdeal = nUi;
+      salvarParametrosGeraisPerfil();
+      logMessage("[CONFIG] Margem de Desligamento de Umidade alterada para +" + String(umidIdeal, 1) + "%" + getClientDetails());
+    } else {
+      logMessage("[ERRO] Margem de umidade fora dos limites (mínimo 0% a mínima + margem = 94%)!" + getClientDetails());
+    }
+  }
+  server.send(200, "text/plain", "OK");
+}
+// Ajuste manual do relógio
 void handleSetHora() {
   if (configuracoesDesbloqueadas && server.hasArg("h") && server.hasArg("m")) {
     int h = server.arg("h").toInt();
@@ -424,13 +469,27 @@ void handleSetHora() {
       horaSimulada = h;
       minutoSimulado = m;
       tempoRelogio = millis(); 
-      logMessage("[CONFIG] Relógio ajustado para " + getHoraSimuladaString() + getClientDetails());
-      if (automacaoAtiva) processarIluminacao();
+      logMessage("[CONFIG] Hora simulada ajustada para " + getHoraSimuladaString() + getClientDetails());
     }
   }
   server.send(200, "text/plain", "OK");
 }
-// configuração do modo de conexão AP ou STA
+// Ajuste automático do relógio via NTP (quando conectado a internet)
+void sincronizarNTP() {
+  if (WiFi.status() == WL_CONNECTED) {
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      horaSimulada = timeinfo.tm_hour;
+      minutoSimulado = timeinfo.tm_min;
+      tempoRelogio = millis(); 
+      logMessage("[NTP] Hora oficial sincronizada com sucesso: " + getHoraSimuladaString());
+    } else {
+      logMessage("[NTP] Falha ao obter hora do servidor NTP.");
+    }
+  }
+}
+// Ajuste do modo wifi (AP ou STA)
 void handleSetWifiMode() {
   if (server.hasArg("mode")) {
     modoWifi = server.arg("mode").toInt();
@@ -442,7 +501,7 @@ void handleSetWifiMode() {
   server.sendHeader("Location", "/");
   server.send(303);
 }
-// Configuração de nome e senha modo AP
+// Aplica nome de rede AP e senha
 void handleSetApCreds() {
   if (server.hasArg("ssid") && server.hasArg("pass")) {
     String nSsid = server.arg("ssid");
@@ -462,7 +521,7 @@ void handleSetApCreds() {
   server.sendHeader("Location", "/");
   server.send(303);
 }
-// Configuração de nome e senha da rede modo cliente STA
+// Aplica nome de rede e senha para conectar modo cliente STA
 void handleSetStaCreds() {
   if (server.hasArg("ssid") && server.hasArg("pass")) {
     ssidSTA = server.arg("ssid");
@@ -478,41 +537,75 @@ void handleSetStaCreds() {
   server.sendHeader("Location", "/");
   server.send(303);
 }
-// rotina de reboot
+// Handle do reset do perfil em uso (acho que da pra reduzir isso aqui juntando no comando de memória)
+void handleRestaurarPerfil() {
+  if (configuracoesDesbloqueadas) {
+    restaurarFabricaPerfilAtivo();
+    logMessage("[CONFIG] Padrões de fábrica restaurados para o perfil " + perfilAtivo + getClientDetails());
+  }
+  server.send(200, "text/plain", "OK");
+}
+// Atuador de restart
 void handleRestart() {
   logMessage("[SISTEMA] Reinicialização solicitada via Web interface..." + getClientDetails());
   server.send(200, "text/plain", "OK");
   delay(100);
   ESP.restart();
 }
-// Sincronização Não-Bloqueante de Hora NTP
-void sincronizarNTP() {
-  if (WiFi.status() == WL_CONNECTED) {
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo)) {
-      horaSimulada = timeinfo.tm_hour;
-      minutoSimulado = timeinfo.tm_min;
-      tempoRelogio = millis(); 
-      logMessage("[NTP] Hora oficial sincronizada com sucesso: " + getHoraSimuladaString());
-    } else {
-      logMessage("[NTP] Falha ao obter hora do servidor NTP.");
-    }
-  }
+// Atualizador de status e campos variáveis na interface web
+void handleStatus() {
+  String json = "{";
+  json += "\"temp\":\"" + String(temperaturaAtual, 1) + "\",";
+  json += "\"umid\":\"" + String(umidadeAtual, 1) + "\",";
+  json += "\"co2\":\"" + String(co2Atual, 0) + "\",";
+  json += "\"horaSim\":\"" + getHoraSimuladaString() + "\",";
+  json += "\"uptime\":\"" + getUptimeString() + "\",";
+  json += "\"tAlvo\":\"" + String(tempAlvo, 1) + "\",";
+  json += "\"tMargem\":\"" + String(tempMargem, 1) + "\",";
+  json += "\"ico2Alvo\":\"" + String(co2Alvo, 0) + "\",";
+  json += "\"ico2Margem\":\"" + String(co2Margem, 0) + "\",";
+  json += "\"uMin\":\"" + String(umidMinima, 1) + "\",";
+  json += "\"uIdeal\":\"" + String(umidIdeal, 1) + "\",";
+  json += "\"perfil\":\"" + perfilAtivo + "\",";
+  json += "\"modoIlu\":\"" + modoIluminacao + "\",";
+  json += "\"durDia\":\"" + String(duracaoDia, 1) + "\",";
+  json += "\"cAuto\":" + String(cicloAuto ? "true" : "false") + ",";
+  json += "\"auto\":" + String(automacaoAtiva ? "true" : "false") + ",";
+  json += "\"unlocked\":" + String(configuracoesDesbloqueadas ? "true" : "false") + ",";
+  json += "\"aq\":" + String(digitalRead(RELE_AQUECIMENTO) == LOW ? "true" : "false") + ",";
+  json += "\"ref\":" + String(digitalRead(RELE_REFRIGERACAO) == LOW ? "true" : "false") + ",";
+  json += "\"ico2\":" + String(digitalRead(RELE_INJECAO_CO2) == LOW ? "true" : "false") + ",";
+  json += "\"ven\":" + String(digitalRead(RELE_VENTILADOR) == LOW ? "true" : "false") + ",";
+  json += "\"um1\":" + String(digitalRead(RELE_UMIDADE_1) == LOW ? "true" : "false") + ",";
+  json += "\"um2\":" + String(digitalRead(RELE_UMIDADE_2) == LOW ? "true" : "false") + ",";
+  json += "\"lB1\":" + String(digitalRead(LUZ_BRANCA1) == LOW ? "true" : "false") + ",";
+  json += "\"lVerm\":" + String(digitalRead(LUZ_VERMELHA) == LOW ? "true" : "false") + ",";
+  json += "\"lB2\":" + String(digitalRead(LUZ_BRANCA2) == LOW ? "true" : "false") + ",";
+  json += "\"lViol\":" + String(digitalRead(LUZ_VIOLETA) == LOW ? "true" : "false") + ",";
+  json += "\"led\":" + String(digitalRead(LED_BUILTIN_PIN) == HIGH ? "true" : "false") + ",";
+  // Correção de caracteres de comando pra não bugar texto.
+  String logEscaped = serialBuffer;
+  logEscaped.replace("\\", "\\\\");
+  logEscaped.replace("\"", "\\\"");
+  logEscaped.replace("\n", "\\n");
+  logEscaped.replace("\r", "");
+  json += "\"log\":\"" + logEscaped + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
 }
-// interface web
+// Pagina web de interface
 void handleRoot() {
   String html = "<!DOCTYPE html><html lang='pt-BR'><head>";
   html += "<meta charset='UTF-8'>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<title>Greenhouse Link v2.28C</title>";
+  html += "<title>Greenhouse Link v2.31B</title>";
   html += "<style>";
   html += "body { font-family: Arial, sans-serif; background-color: #f0f2f5; margin: 20px; display: flex; flex-direction: column; gap: 20px; }";
   html += ".box { background: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }";
   html += "h2, h3, h4 { margin-top: 0; color: #2e7d32; font-size: 1.2rem; border-bottom: 2px solid #e8f5e9; padding-bottom: 8px; }";
   html += "h4 { border-bottom: none; font-size: 1.0rem; margin-bottom: 8px; }";
-  html += ".sensor-row { display: flex; justify-content: space-around; background: #e8f5e9; padding: 15px; border-radius: 8px; margin-bottom: 10px; font-size: 1.2rem; font-weight: bold; color: #1b5e20; }";
-  html += ".clock-row { background: #e8f5e9; padding: 10px 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; color: #1b5e20; display: flex; justify-content: space-between; }";
+  html += ".sensor-row { display: flex; justify-content: space-around; flex-wrap: wrap; gap: 10px; background: #e8f5e9; padding: 15px; border-radius: 8px; margin-bottom: 10px; font-size: 1.2rem; font-weight: bold; color: #1b5e20; }";
+  html += ".clock-row { background: #e8f5e9; padding: 10px 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; color: #1b5e20; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }";
   html += ".pin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }";
   html += ".pin-btn { padding: 12px 8px; border-radius: 5px; color: white; font-weight: bold; text-align: center; border: none; width: 100%; font-size: 0.85rem; }";
   html += ".clickable { cursor: pointer; transition: transform 0.1s; }";
@@ -522,13 +615,13 @@ void handleRoot() {
   html += ".btn-control { display: inline-block; padding: 12px 24px; font-size: 1rem; font-weight: bold; color: white; border-radius: 5px; border: none; cursor: pointer; }";
   html += ".btn-pause { background-color: #dc3545; }";
   html += ".btn-resume { background-color: #28a745; }";
-  html += ".config-info { background: #f8f9fa; padding: 12px; border-radius: 6px; margin: 15px 0; border-left: 4px solid #2e7d32; }";
+  html += ".config-info { background: #f8f9fa; padding: 12px; border-radius: 6px; margin: 15px 0; border-left: 4px solid #2e7d32; display: flex; flex-direction: column; gap: 6px; }";
   html += ".profile-btns { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; }";
   html += ".btn-profile { padding: 8px 16px; border: 1px solid #2e7d32; background: white; color: #2e7d32; border-radius: 4px; font-weight: bold; cursor: pointer; }";
   html += ".btn-profile.active { background: #2e7d32; color: white; }";
   html += ".btn-profile:disabled { opacity: 0.5; cursor: not-allowed; border-color: #ccc; color: #666; background: #eee; }";
   html += ".input-group { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }";
-  html += ".input-group label { width: 220px; font-weight: bold; font-size: 0.9rem; }";
+  html += ".input-group label { width: 240px; font-weight: bold; font-size: 0.9rem; }";
   html += ".input-group input, .sub-box input, select { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }";
   html += ".input-group .time-input { width: 50px; text-align: center; }";
   html += ".btn-action { padding: 8px 16px; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin-right: 10px; }";
@@ -538,12 +631,13 @@ void handleRoot() {
   html += ".dos-prompt { background-color: #000000; color: #00ff00; font-family: 'Courier New', Courier, monospace; ";
   html += "padding: 15px; border-radius: 5px; height: 250px; overflow-y: auto; white-space: pre-wrap; font-size: 0.9rem; line-height: 1.2; }";
   html += "</style></head><body>";
-  // CAIXA 1
+  // CAIXA 1 
   html += "<div class='box'>";
   html += "<h2>1. Status da Estufa</h2>";
   html += "<div class='sensor-row'>";
   html += "<div>Temp: <span id='valTemp'>--</span> &deg;C</div>";
   html += "<div>Umid: <span id='valUmid'>--</span> %</div>";
+  html += "<div>CO&sup2;: <span id='valCo2'>--</span> ppm</div>";
   html += "</div>";
   html += "<div class='clock-row'>";
   html += "<div>Hora Simulada: <span id='valHora'>--:--</span></div>";
@@ -552,6 +646,8 @@ void handleRoot() {
   html += "<div class='pin-grid'>";
   html += "<button id='btnAq' class='pin-btn off' onclick='cliquePino(33)'>Aquecedor<br><small id='txtAq'>INATIVO</small></button>";
   html += "<button id='btnVen' class='pin-btn off' onclick='cliquePino(32)'>Ventilador<br><small id='txtVen'>INATIVO</small></button>";
+  html += "<button id='btnRef' class='pin-btn off' onclick='cliquePino(16)'>Refrigeração<br><small id='txtRef'>INATIVO</small></button>";
+  html += "<button id='btnico2' class='pin-btn off' onclick='cliquePino(17)'>Injeção CO²<br><small id='txtico2'>INATIVO</small></button>";
   html += "<button id='btnUm1' class='pin-btn off' onclick='cliquePino(4)'>Umidificador<br><small id='txtUm1'>INATIVO</small></button>";
   html += "<button id='btnUm2' class='pin-btn off' onclick='cliquePino(14)'>Gatilho Umid.<br><small id='txtUm2'>INATIVO</small></button>";
   html += "<button id='btnLB1' class='pin-btn off' onclick='cliquePino(27)'>Luz Branca 1<br><small id='txtLB1'>INATIVO</small></button>";
@@ -562,10 +658,10 @@ void handleRoot() {
   html += "</div></div>";
   // CAIXA 2
   html += "<div class='box'>";
-  html += "<h2>2. Monitor Serial</h2>";
+  html += "<h2>2. Monitor</h2>";
   html += "<div class='dos-prompt' id='dosConsole'></div>";
   html += "</div>";
-    // CAIXA 3
+  // CAIXA 3 
   html += "<div class='box'>";
   html += "<h2>3. Controle de Automação & Configuração</h2>";
   html += "<div id='boxAutomacao'>Carregando status...</div>";
@@ -573,11 +669,11 @@ void handleRoot() {
   html += "<div><strong>Perfil Ativo:</strong> <span id='lblPerfil'>--</span></div>";
   html += "<div><strong>Modo de Iluminação:</strong> <span id='lblModoIlu'>--</span></div>";
   html += "<div><strong>Duração do Dia:</strong> <span id='lblDurDia'>--</span> h (Ancorado no Meio-Dia)</div>";
-  html += "<div><strong>Temp. Alvo:</strong> <span id='lblTAlvo'>--</span> &deg;C (&plusmn;1.0 &deg;C)</div>";
-  html += "<div><strong>Umid. Mínima:</strong> <span id='lblUMin'>--</span> % (Desliga em <span id='lblUDesl'>--</span> %)</div>";
+  html += "<div><strong>Temp. Alvo:</strong> <span id='lblTAlvo'>--</span> &deg;C (&plusmn;<span id='lblTMargem'>--</span> &deg;C)</div>";
+  html += "<div><strong>CO² Alvo:</strong> <span id='lblico2Alvo'>--</span> ppm (&plusmn;<span id='lblico2Margem'>--</span> ppm)</div>";
+  html += "<div><strong>Umid. Mínima:</strong> <span id='lblUMin'>--</span> % (Desliga em <span id='lblUDesl'>--</span> % [Min + <span id='lblUIdeal'>--</span>%])</div>";
   html += "<div><strong>Ciclo Dia/Noite:</strong> <span id='lblCAuto'>--</span></div>";
   html += "</div>";
-
   html += "<div style='font-size:0.9rem; font-weight:bold; margin-bottom:5px;'>Perfis Disponíveis:</div>";
   html += "<div class='profile-btns'>";
   html += "<button id='btnInc' class='btn-profile' onclick=\"setPerfil('inc')\">Incubação</button>";
@@ -611,9 +707,29 @@ void handleRoot() {
   html += "<button id='btnApplyTemp' class='btn-action' style='background:#007bff;' onclick='aplicarTemp()'>Aplicar</button>";
   html += "</div>";
   html += "<div class='input-group'>";
+  html += "<label for='inTMargem'>Margem Temp (&plusmn;&deg;C):</label>";
+  html += "<input type='number' id='inTMargem' step='0.1' min='0.5' max='5.0' placeholder='Ex: 1.0'> ";
+  html += "<button id='btnApplyTMargem' class='btn-action' style='background:#007bff;' onclick='aplicarTMargem()'>Aplicar</button>";
+  html += "</div>";
+  html += "<div class='input-group'>";
+  html += "<label for='inco2Alvo'>CO² Alvo (ppm):</label>";
+  html += "<input type='number' id='inco2Alvo' step='1.0' min='500.0' max='2000.0' placeholder='Ex: 800'> ";
+  html += "<button id='btnApplyco2Ideal' class='btn-action' style='background:#007bff;' onclick='aplicarco2Alvo()'>Aplicar</button>";
+  html += "</div>";
+  html += "<div class='input-group'>";
+  html += "<label for='inco2Margem'>Margem CO² (ppm):</label>";
+  html += "<input type='number' id='inco2Margem'  step='1.0' min='100.0' max='1000.0' placeholder='Ex: 500'> ";
+  html += "<button id='btnApplyco2Margem' class='btn-action' style='background:#007bff;' onclick='aplicarco2Margem()'>Aplicar</button>";
+  html += "</div>";
+  html += "<div class='input-group'>";
   html += "<label for='inUmid'>Umid. Mínima (%):</label>";
-  html += "<input type='number' id='inUmid' step='1.0' placeholder='Ex: 75'> ";
+  html += "<input type='number' id='inUmid' step='1.0' placeholder='Ex: 90'> ";
   html += "<button id='btnApplyUmid' class='btn-action' style='background:#007bff;' onclick='aplicarUmid()'>Aplicar</button>";
+  html += "</div>";
+  html += "<div class='input-group'>";
+  html += "<label for='inUmiIdeal'>Margem Desl. Umid (%):</label>";
+  html += "<input type='number' id='inUmiIdeal' step='0.5' min='0.0' max='20.0' placeholder='Ex: 5.0'> ";
+  html += "<button id='btnApplyUmiIdeal' class='btn-action' style='background:#007bff;' onclick='aplicarUmiIdeal()'>Aplicar</button>";
   html += "</div>";
   html += "<div class='input-group' style='margin-top:15px;'>";
   html += "<label for='inNovaSenha'>Trocar senha de acesso:</label>";
@@ -629,44 +745,50 @@ void handleRoot() {
   html += "<div class='box'>";
   html += "<h2>4. Conectividade</h2>";
   html += "<form action='/set_wifi_mode' method='POST'>";
-  html += "Modo de Operação: <select name='mode' onchange='this.form.submit()'>";
+  html += "Modo de Operação: <select id='selWifiMode' name='mode' onchange='this.form.submit()'>";
   html += "<option value='0'" + String(modoWifi == 0 ? " selected" : "") + ">Apenas Ponto de Acesso (AP)</option>";
   html += "<option value='1'" + String(modoWifi == 1 ? " selected" : "") + ">Cliente Wi-Fi (STA + AP Automático)</option>";
   html += "</select></form>";
   html += "<div class='sub-box'>";
   html += "<h4>Configuração AP (ponto de acesso wireless)</h4>";
   html += "<form action='/set_ap_creds' method='POST'>";
-  html += "SSID AP: <input type='text' name='ssid' value='" + ssidAP + "'> ";
-  html += "Senha AP: <input type='password' name='pass' placeholder='••••••••'> ";
-  html += "<button class='btn-action' style='background:#28a745;' type='submit'>Salvar AP</button>";
+  html += "SSID AP: <input type='text' id='inApSsid' name='ssid' value='" + ssidAP + "'> ";
+  html += "Senha AP: <input type='password' id='inApPass' name='pass' placeholder='••••••••'> ";
+  html += "<button id='btnSaveAp' class='btn-action' style='background:#28a745;' type='submit'>Salvar AP</button>";
   html += "</form>";
   html += "</div>";
   html += "<div class='sub-box'>";
   html += "<h4>Configuração STA (modo Cliente Wi-Fi)</h4>";
   html += "<form action='/set_sta_creds' method='POST'>";
-  html += "Rede Wi-Fi: <input type='text' name='ssid' value='" + ssidSTA + "'> ";
-  html += "Senha Wi-Fi: <input type='password' name='pass' placeholder='********'> ";
-  html += "<button class='btn-action' style='background:#28a745;' type='submit'>Salvar conexão WLAN</button>";
+  html += "Rede Wi-Fi: <input type='text' id='inStaSsid' name='ssid' value='" + ssidSTA + "'> ";
+  html += "Senha Wi-Fi: <input type='password' id='inStaPass' name='pass' placeholder='********'> ";
+  html += "<button id='btnSaveSta' class='btn-action' style='background:#28a745;' type='submit'>Salvar conexão WLAN</button>";
   html += "</form>";
   html += "<p><small>Endereço local em modo Cliente: <b>http://greenhouse-link.local</b></small></p>";
   html += "</div>";
   html += "<div style='margin-top:15px; border-top:1px solid #eee; padding-top:10px;'>";
-  html += "<button class='btn-action' style='background-color:#ff9800;' onclick='reiniciarESP()'>Reiniciar ESP32</button>";
+  html += "<button id='btnRestart' class='btn-action' style='background-color:#ff9800;' onclick='reiniciarESP()'>Reiniciar ESP32</button>";
   html += "<small style='color:#666;'>Use este botão para aplicar alterações de rede.</small>";
   html += "</div></div>";
   html += "<script>";
+  // Fim dos itens visuais concatenados e início da mecânica web
   html += "function atualizarStatus() {";
   html += "  fetch('/status').then(r => r.json()).then(d => {";
   html += "    document.getElementById('valTemp').innerText = d.temp;";
   html += "    document.getElementById('valUmid').innerText = d.umid;";
+  html += "    document.getElementById('valCo2').innerText = d.co2;";
   html += "    document.getElementById('valHora').innerText = d.horaSim;";
   html += "    document.getElementById('valUptime').innerText = d.uptime;";
   html += "    document.getElementById('lblPerfil').innerText = d.perfil;";
   html += "    document.getElementById('lblModoIlu').innerText = d.modoIlu;";
   html += "    document.getElementById('lblDurDia').innerText = d.durDia;";
   html += "    document.getElementById('lblTAlvo').innerText = d.tAlvo;";
+  html += "    document.getElementById('lblTMargem').innerText = d.tMargem;";
+  html += "    document.getElementById('lblico2Alvo').innerText = d.ico2Alvo;";
+  html += "    document.getElementById('lblico2Margem').innerText = d.ico2Margem;";
   html += "    document.getElementById('lblUMin').innerText = d.uMin;";
-  html += "    document.getElementById('lblUDesl').innerText = (parseFloat(d.uMin) + 5.0).toFixed(1);";
+  html += "    document.getElementById('lblUIdeal').innerText = d.uIdeal;";
+  html += "    document.getElementById('lblUDesl').innerText = (parseFloat(d.uMin) + parseFloat(d.uIdeal)).toFixed(1);";
   html += "    document.getElementById('lblCAuto').innerText = d.cAuto ? 'AUTOMÁTICO' : 'MANUAL';";
   html += "    let btnC = document.getElementById('btnToggleCiclo');";
   html += "    btnC.innerText = d.cAuto ? 'AUTOMÁTICO' : 'MANUAL';";
@@ -675,10 +797,10 @@ void handleRoot() {
   html += "    let aviso = document.getElementById('txtAviso');";
   html += "    let lock = !d.unlocked;"; 
   html += "    if(!d.unlocked) {";
-  html += "      autoBox.innerHTML = \"<p>Estado Atual: <strong style='color: #28a745;'>AUTOMAÇÃO ATIVA</strong></p><button class='btn-control btn-pause' onclick='desbloquearConfig()'>Desbloquear configurações</button>\";";
+  html += "      autoBox.innerHTML = \"<p>Estado Atual: <strong style='color:#dc3545;'>CONFIGURAÇÕES BLOQUEADAS</strong></p><button class='btn-control btn-pause' onclick='desbloquearConfig()'>Desbloquear configurações</button>\";";
   html += "      aviso.innerText = '* Insira a senha para habilitar o painel de alteração de parâmetros e controle manual.';";
   html += "    } else {";
-  html += "      autoBox.innerHTML = \"<p>Estado Atual: <strong style='color: #dc3545;'>AUTOMAÇÃO INTERROMPIDA</strong></p><button class='btn-control btn-resume' onclick='bloquearConfig()'>Bloquear configurações</button>\";";
+  html += "      autoBox.innerHTML = \"<p>Estado Atual: <strong style='color:#28a745;'>CONFIGURAÇÕES DESBLOQUEADAS</strong></p><button class='btn-control btn-resume' onclick='bloquearConfig()'>Bloquear configurações</button>\";";
   html += "      aviso.innerText = '';";
   html += "    }";
   html += "    document.getElementById('btnInc').className = 'btn-profile' + (d.perfil === 'Incubação' ? ' active' : '');";
@@ -696,14 +818,30 @@ void handleRoot() {
   html += "    document.getElementById('btnApplyHora').disabled = lock;";
   html += "    document.getElementById('btnApplyDur').disabled = lock;";
   html += "    document.getElementById('btnApplyTemp').disabled = lock;";
+  html += "    document.getElementById('btnApplyTMargem').disabled = lock;";
+  html += "    document.getElementById('btnApplyco2Margem').disabled = lock;";
+  html += "    document.getElementById('btnApplyco2Ideal').disabled = lock;";
   html += "    document.getElementById('btnApplyUmid').disabled = lock;";
+  html += "    document.getElementById('btnApplyUmiIdeal').disabled = lock;";
   html += "    document.getElementById('btnApplySenha').disabled = lock;";
   html += "    document.getElementById('inTemp').disabled = lock;";
+  html += "    document.getElementById('inTMargem').disabled = lock;";
+  html += "    document.getElementById('inco2Alvo').disabled = lock;";
+  html += "    document.getElementById('inco2Margem').disabled = lock;";
   html += "    document.getElementById('inUmid').disabled = lock;";
+  html += "    document.getElementById('inUmiIdeal').disabled = lock;";
   html += "    document.getElementById('inHora').disabled = lock;";
   html += "    document.getElementById('inMin').disabled = lock;";
   html += "    document.getElementById('inDur').disabled = lock;";
   html += "    document.getElementById('inNovaSenha').disabled = lock;";
+  html += "    document.getElementById('selWifiMode').disabled = lock;";
+  html += "    document.getElementById('inApSsid').disabled = lock;";
+  html += "    document.getElementById('inApPass').disabled = lock;";
+  html += "    document.getElementById('btnSaveAp').disabled = lock;";
+  html += "    document.getElementById('inStaSsid').disabled = lock;";
+  html += "    document.getElementById('inStaPass').disabled = lock;";
+  html += "    document.getElementById('btnSaveSta').disabled = lock;";
+  html += "    document.getElementById('btnRestart').disabled = lock;";
   html += "    function renderBtn(idBtn, idTxt, ativo, unlocked) {";
   html += "      let b = document.getElementById(idBtn);";
   html += "      let t = document.getElementById(idTxt);";
@@ -711,6 +849,8 @@ void handleRoot() {
   html += "      t.innerText = (ativo ? 'ATIVO' : 'INATIVO') + (unlocked ? ' (Clique)' : '');";
   html += "    }";
   html += "    renderBtn('btnAq', 'txtAq', d.aq, d.unlocked);";
+  html += "    renderBtn('btnRef', 'txtRef', d.ref, d.unlocked);";
+  html += "    renderBtn('btnico2', 'txtico2', d.ico2, d.unlocked);";
   html += "    renderBtn('btnVen', 'txtVen', d.ven, d.unlocked);";
   html += "    renderBtn('btnUm1', 'txtUm1', d.um1, d.unlocked);";
   html += "    renderBtn('btnUm2', 'txtUm2', d.um2, d.unlocked);";
@@ -742,9 +882,25 @@ void handleRoot() {
   html += "  let t = document.getElementById('inTemp').value;";
   html += "  if(t !== '') fetch('/setTempAlvo?t=' + t).then(() => { document.getElementById('inTemp').value = ''; atualizarStatus(); });";
   html += "}";
+  html += "function aplicarTMargem() {";
+  html += "  let tm = document.getElementById('inTMargem').value;";
+  html += "  if(tm !== '') fetch('/setTempMargem?tm=' + tm).then(() => { document.getElementById('inTMargem').value = ''; atualizarStatus(); });";
+  html += "}";
+  html += "function aplicarco2Alvo() {";
+  html += "  let co = document.getElementById('inco2Alvo').value;";
+  html += "  if(co !== '') fetch('/setco2Alvo?co=' + co).then(() => { document.getElementById('inco2Alvo').value = ''; atualizarStatus(); });";
+  html += "}";
+  html += "function aplicarco2Margem() {";
+  html += "  let com = document.getElementById('inco2Margem').value;";
+  html += "  if(com !== '') fetch('/setco2Margem?com=' + com).then(() => { document.getElementById('inco2Margem').value = ''; atualizarStatus(); });";
+  html += "}";
   html += "function aplicarUmid() {";
   html += "  let u = document.getElementById('inUmid').value;";
   html += "  if(u !== '') fetch('/setUmidMin?u=' + u).then(() => { document.getElementById('inUmid').value = ''; atualizarStatus(); });";
+  html += "}";
+  html += "function aplicarUmiIdeal() {";
+  html += "  let ui = document.getElementById('inUmiIdeal').value;";
+  html += "  if(ui !== '') fetch('/setUmidIdeal?ui=' + ui).then(() => { document.getElementById('inUmiIdeal').value = ''; atualizarStatus(); });";
   html += "}";
   html += "function aplicarSenha() {";
   html += "  let p = document.getElementById('inNovaSenha').value;";
@@ -780,9 +936,9 @@ void handleRoot() {
   html += "</body></html>";
   server.send(200, "text/html", html);
 }
-
+//------------------------INICIO VOID SETUP
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(115200); // Início da comunicação e configuração inicial dos pinos high = off
   pinMode(LED_BUILTIN_PIN, OUTPUT);
   pinMode(BTN_RESET, INPUT_PULLUP);
   pinMode(RELE_AQUECIMENTO, OUTPUT);
@@ -793,6 +949,10 @@ void setup() {
   pinMode(LUZ_VERMELHA, OUTPUT);
   pinMode(LUZ_BRANCA2, OUTPUT);
   pinMode(LUZ_VIOLETA, OUTPUT);
+  pinMode(RELE_REFRIGERACAO, OUTPUT);
+  pinMode(RELE_INJECAO_CO2, OUTPUT);
+  digitalWrite(RELE_REFRIGERACAO, HIGH);
+  digitalWrite(RELE_INJECAO_CO2, HIGH);
   digitalWrite(RELE_AQUECIMENTO, HIGH);
   digitalWrite(RELE_VENTILADOR, HIGH);
   digitalWrite(RELE_UMIDADE_1, HIGH);
@@ -801,17 +961,32 @@ void setup() {
   digitalWrite(LUZ_VERMELHA, HIGH);
   digitalWrite(LUZ_BRANCA2, HIGH);
   digitalWrite(LUZ_VIOLETA, HIGH);
-  delay(5000);
-// inicializacão
+  delay(5000); // Pausa para conectar monitor serial cabeado
   logMessage("[GREENHOUSE] Sistema iniciando...");
+  logMessage("[SISTEMA] Cultivo de " + modoIluminacao + " configurado.");
+  // ---- AUTO-DETECÇÃO DE SENSOR (DHT11 ou SCD30) ----
   dht.begin();
+  float testT = dht.readTemperature();
+  float testU = dht.readHumidity();
+  if (!isnan(testT) && !isnan(testU)) {
+    usaDHT11 = true;
+    logMessage("[SISTEMA] Sensor DHT11 detectado e em uso.");
+  } else {
+    Wire.begin(); 
+    if (airSensor.begin()) {
+      usaSCD30 = true;
+      airSensor.setMeasurementInterval(2);
+      logMessage("[SISTEMA] DHT11 não encontrado. Sensor SCD30 ativado com sucesso via I2C!");
+    } else {
+      logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] ERRO: Falha de leitura no sensor de ambiente!");
+    }
+  }
+  // Configura conexão baseada na memória
   carregarConfiguracoesRede();
   prefs.begin("greenhouse", true);
   String savedPerfil = prefs.getString("perfil_ativo", "Frutificação");
   prefs.end();
   carregarPerfil(savedPerfil);
-  logMessage("[SISTEMA] Cultivo de " + modoIluminacao + " configurado.");
-  // Inicialização Wi-Fi
   WiFi.persistent(false); 
   if (modoWifi == 0) {
     WiFi.mode(WIFI_AP);
@@ -830,7 +1005,7 @@ void setup() {
       logMessage("[REDE] Modo Cliente selecionado, mas nenhum SSID configurado.");
     }
   }
-  // Coleta de cabeçalhos para registrar User-Agent
+// 
   const char* headerkeys[] = {"User-Agent"};
   server.collectHeaders(headerkeys, 1);
   server.on("/", handleRoot);
@@ -844,7 +1019,11 @@ void setup() {
   server.on("/setModoIlu", handleSetModoIluminacao);
   server.on("/setDuracaoDia", handleSetDuracaoDia);
   server.on("/setTempAlvo", handleSetTempAlvo);
+  server.on("/setTempMargem", handleSetTempMargem);
+  server.on("/setco2Alvo", handleSetco2Alvo);
+  server.on("/setco2Margem", handleSetco2Margem);
   server.on("/setUmidMin", handleSetUmidMin);
+  server.on("/setUmidIdeal", handleSetUmidIdeal);
   server.on("/restaurarPerfil", handleRestaurarPerfil);
   server.on("/setHora", handleSetHora);
   server.on("/set_wifi_mode", HTTP_POST, handleSetWifiMode);
@@ -853,18 +1032,18 @@ void setup() {
   server.on("/restart", handleRestart);
   server.begin();
   logMessage("[GREENHOUSE] Web Server rodando na porta 80 padrão.");
-  logMessage("[GREENHOUSE] Sistemas ativos!");
 }
-
+//-----------------------INICIO VOID LOOP
 void loop() {
-  tempoAtual = millis();
+  tempoAtual = millis(); // Atualiza o cronometro geral
+// Verifica a conexão e atualiza o relógio
   if (WiFi.status() == WL_CONNECTED) {
     if (tempoUltimoNTP == 0 || (tempoAtual - tempoUltimoNTP >= INTERVALO_NTP)) {
       tempoUltimoNTP = tempoAtual;
       sincronizarNTP();
     }
   }
-  // Reset para config de fabrica
+// Botão de reset físico
   if (digitalRead(BTN_RESET) == LOW) {
     Serial.println("[GREENHOUSE] Botão BOOT detectado. Mantenha pressionado por 5s para Reset...");
     unsigned long tPress = millis();
@@ -880,14 +1059,14 @@ void loop() {
       prefs.clear();
       prefs.end();
       for (int i = 0; i < 10; i++) {
-        digitalWrite(LED_BUILTIN_PIN, HIGH); delay(500);
-        digitalWrite(LED_BUILTIN_PIN, LOW); delay(500);
+        digitalWrite(LED_BUILTIN_PIN, HIGH); delay(50);
+        digitalWrite(LED_BUILTIN_PIN, LOW); delay(50);
       }
       ESP.restart();
     }
   }
   server.handleClient(); 
-  // Máquina de Estados Não-Bloqueante para Wi-Fi (STA + AP)
+// Mecanismo da conexão wifi  
   if (modoWifi == 1) {
     if (tentandoConectarWifi) {
       if (WiFi.status() == WL_CONNECTED) {
@@ -901,7 +1080,7 @@ void loop() {
         logMessage("[REDE] AP de emergência desligado por segurança.");
       } else if (tempoAtual - tempoInicioConexaoWifi >= TIMEOUT_CONEXAO_WIFI) {
         tentandoConectarWifi = false;
-        tempoUltimaTentativaWifi = tempoAtual;
+        tempoUltimaTentativaWifi = tempoAtual;        
         WiFi.disconnect(false);
         WiFi.mode(WIFI_AP_STA);
         WiFi.softAP(ssidAP.c_str(), passAP.c_str(), 1);
@@ -930,17 +1109,7 @@ void loop() {
       }
     }
   }
-// Controle da velocidade de piscar do led D2 
-    if (automacaoAtiva) {
-      if (tempoAtual - tempoLed >= 1000) {
-      tempoLed = tempoAtual;
-      estadoLed = !estadoLed;
-      if (automacaoAtiva && !tentandoConectarWifi) {
-        digitalWrite(LED_BUILTIN_PIN, estadoLed);
-    }
-    }
-  }
-  // Relógio Simulado
+// Mecanismo do relógio
   if (tempoAtual - tempoRelogio >= 60000) {
     tempoRelogio = tempoAtual;
     minutoSimulado++;
@@ -953,70 +1122,117 @@ void loop() {
       processarIluminacao();
     }
   }
-  static unsigned long tempoSensor = 0;
-  static unsigned long tempoLogSensor = 0;
-  if (tempoAtual - tempoSensor >= 3000) {
+  // --- LEITURA DO SENSOR (DHT11 ou SCD30 com captura de CO2) ---
+  // O ciclo é de 3 segundos (3000ms) para acompanhar a carga de leitura do SCD30
+	if (tempoAtual - tempoSensor >= 3000) {
     tempoSensor = tempoAtual;
-    float u = dht.readHumidity();
-    float t = dht.readTemperature();
-    if (!isnan(u) && !isnan(t)) {
-      umidadeAtual = u;
-      temperaturaAtual = t;
+    leituraSucesso = false; // Utiliza a variável global
+    // LÓGICA DE LEITURA
+    if (usaSCD30) {
+      if (airSensor.dataAvailable()) {
+        temperaturaAtual = airSensor.getTemperature();
+        umidadeAtual = airSensor.getHumidity();
+        co2Atual = airSensor.getCO2();
+        leituraSucesso = true;
+      }
+    } else if (usaDHT11) {
+      float t = dht.readTemperature();
+      float u = dht.readHumidity();
+      if (!isnan(t) && !isnan(u)) {
+        temperaturaAtual = t;
+        umidadeAtual = u;
+        leituraSucesso = true;
+      }
+    }
+// PROCESSAMENTO DO LOG
+    if (leituraSucesso) {
+      // Loga os dados no console a cada 60 segundos
       if (tempoAtual - tempoLogSensor >= 60000 || tempoLogSensor == 0) {
         tempoLogSensor = tempoAtual;
-        logMessage("[" + getHoraSimuladaString() + "] T:" + String(temperaturaAtual, 1) + "ºC | U:" + String(umidadeAtual, 0) + "%");
+        if (usaSCD30) {
+          logMessage("[" + getHoraSimuladaString() + "] T:" + String(temperaturaAtual, 1) + "ºC | U:" + String(umidadeAtual, 0) + "% | CO2:" + String(co2Atual, 0) + "ppm");
+        } else {
+          logMessage("[" + getHoraSimuladaString() + "] T:" + String(temperaturaAtual, 1) + "ºC | U:" + String(umidadeAtual, 0) + "%");
+        }
       }
     } else {
-      if (tempoAtual - tempoLogSensor >= 10000) {
+      // Se falhar, avisa a cada 10 segundos para não inundar o console
+      if (tempoAtual - tempoLogSensor >= 10000 || tempoLogSensor == 0) {
         tempoLogSensor = tempoAtual;
-        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] ERRO: Falha de leitura no sensor DHT!");
+        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor indisponível! Interrompendo atuadores de ambiente...");
+        digitalWrite(RELE_REFRIGERACAO, HIGH);
+        digitalWrite(RELE_INJECAO_CO2, HIGH);
+        digitalWrite(RELE_AQUECIMENTO, HIGH);
+        digitalWrite(RELE_VENTILADOR, HIGH);
+        digitalWrite(RELE_UMIDADE_1, HIGH);
+        digitalWrite(RELE_UMIDADE_2, HIGH);
       }
     }
   }
-  // Malha de Automação
-  if (automacaoAtiva) {
-    if (temperaturaAtual > 0) { 
-      if (temperaturaAtual < (tempAlvo - TEMP_MARGEM)) {
-        if (digitalRead(RELE_AQUECIMENTO) == HIGH) { 
-          digitalWrite(RELE_AQUECIMENTO, LOW);
-          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Baixa! Aquecimento LIGADO!");
-        }
-      } else if (temperaturaAtual >= tempAlvo) {
-        if (digitalRead(RELE_AQUECIMENTO) == LOW) { 
-          digitalWrite(RELE_AQUECIMENTO, HIGH);
-          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Alvo atingida. Aquecimento DESL.");
+// Pisca LED automação ativa
+  if (automacaoAtiva) { // executa tudo quando automação == ativa
+	  if (tempoAtual - tempoLed >= 3000) { // tempo da rotina para executar itens dentro do loop
+ 	   tempoLed = tempoAtual;
+ 	   estadoLed = !estadoLed;
+ 	   if (!tentandoConectarWifi) {
+ 	     digitalWrite(LED_BUILTIN_PIN, estadoLed);
+ 	   }
+    // Segurança dos atuadores em caso de falha (não atuam)
+    if (leituraSucesso) {
+    // Lógica de Temperatura
+      if (temperaturaAtual < (tempAlvo - tempMargem) && digitalRead(RELE_AQUECIMENTO) == HIGH) { 
+        digitalWrite(RELE_AQUECIMENTO, LOW);
+        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Baixa! Aquecimento LIGADO!");
+      } else if (temperaturaAtual >= tempAlvo && digitalRead(RELE_AQUECIMENTO) == LOW) { 
+        digitalWrite(RELE_AQUECIMENTO, HIGH);
+        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Alvo atingida. Aquecimento DESL.");
+      }
+      if (temperaturaAtual > (tempAlvo + tempMargem) && digitalRead(RELE_REFRIGERACAO) == HIGH) {
+        digitalWrite(RELE_REFRIGERACAO, LOW);
+        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Alta! Refrigeração LIGADA!");
+      } else if (temperaturaAtual <= tempAlvo && digitalRead(RELE_REFRIGERACAO) == LOW) {
+        digitalWrite(RELE_REFRIGERACAO, HIGH);
+        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Alvo atingida. Refrigeração DESL.");
+      }
+    // Lógica do controle de CO2
+      if (co2Atual > (co2Alvo + co2Margem) && digitalRead(RELE_VENTILADOR) == HIGH) {
+        estadoVentilar = true;
+        digitalWrite(RELE_VENTILADOR, LOW); 
+        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Nível de CO2 ELEVADO! Exaustão LIGADA!");
+      } else if (co2Atual <= co2Alvo && digitalRead(RELE_VENTILADOR) == LOW) {
+        estadoVentilar = false;
+        digitalWrite(RELE_VENTILADOR, HIGH);
+        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Nível de CO2 OK. Exaustão DESL.");
+      }
+      if (co2Atual < (co2Alvo - co2Margem) && digitalRead(RELE_INJECAO_CO2) == HIGH) {
+        estadoInjecaoCO2 = true;
+        digitalWrite(RELE_INJECAO_CO2, LOW);
+        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Nível de CO2 BAIXO! Injeção ATIVADA!");
+      } else if (co2Atual >= co2Alvo && digitalRead(RELE_INJECAO_CO2) == LOW) {
+        estadoInjecaoCO2 = false;
+        digitalWrite(RELE_INJECAO_CO2, HIGH);
+        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] CO2 alvo alcançado. Injeção DESL.");
+      }
+      // Acionamento do umidificador
+      if (umidadeAtual > 0) {
+        if (umidadeAtual < umidMinima) {
+          precisaUmidificar = true;
+        } else if (umidadeAtual >= (umidMinima + umidIdeal)) {
+          if (precisaUmidificar) {
+            logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Umid. Reestabelecida. Umidificador DESLIGADO.");
+            precisaUmidificar = false;
+            digitalWrite(RELE_UMIDADE_1, HIGH);
+            digitalWrite(RELE_UMIDADE_2, HIGH);
+            etapaUmidade = 0; 
+          } else if (digitalRead(RELE_UMIDADE_1) == LOW) {
+            logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Umid. OK. Umidificador DESLIGADO.");
+            digitalWrite(RELE_UMIDADE_1, HIGH);
+            digitalWrite(RELE_UMIDADE_2, HIGH);
+            etapaUmidade = 0;
+          }
         }
       }
-      if (temperaturaAtual > (tempAlvo + TEMP_MARGEM)) {
-        if (digitalRead(RELE_VENTILADOR) == HIGH) {
-          digitalWrite(RELE_VENTILADOR, LOW);
-          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Alta! Ventilador LIGADO!");
-        }
-      } else if (temperaturaAtual <= tempAlvo) {
-        if (digitalRead(RELE_VENTILADOR) == LOW) {
-          digitalWrite(RELE_VENTILADOR, HIGH);
-          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Alvo atingida. Ventilador DESL.");
-        }
-      }
-    }
-    if (umidadeAtual > 0) {
-      if (umidadeAtual < umidMinima) {
-        precisaUmidificar = true;
-      } else if (umidadeAtual >= (umidMinima + 5.0)) {
-        if (precisaUmidificar) {
-          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Umid. Reestabelecida. Umidificador DESLIGADO.");
-          precisaUmidificar = false;
-          digitalWrite(RELE_UMIDADE_1, HIGH);
-          digitalWrite(RELE_UMIDADE_2, HIGH);
-          etapaUmidade = 0; 
-        } else if (digitalRead(RELE_UMIDADE_1) == LOW) {
-          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Umid. OK. Umidificador DESLIGADO.");
-          digitalWrite(RELE_UMIDADE_1, HIGH);
-          digitalWrite(RELE_UMIDADE_2, HIGH);
-          etapaUmidade = 0;
-        }
-      }
-    }
+    // Sequência de acionamento do umidificador e gatilho
     if (precisaUmidificar) {
       if (etapaUmidade == 0) {
         digitalWrite(RELE_UMIDADE_1, LOW); 
@@ -1040,7 +1256,9 @@ void loop() {
         digitalWrite(RELE_UMIDADE_1, HIGH);
         digitalWrite(RELE_UMIDADE_2, HIGH);
         etapaUmidade = 0;
+        } 
       }
     }
   }
+}
 }
