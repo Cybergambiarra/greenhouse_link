@@ -1,4 +1,8 @@
 #include <WiFi.h>
+#include <time.h>
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <DHT.h>
@@ -10,12 +14,12 @@ const char* ntpServer = "a.st1.ntp.br";
 const long gmtOffset_sec = -10800;       
 const int daylightOffset_sec = 0;
 unsigned long tempoUltimoNTP = 0;
-const unsigned long INTERVALO_NTP = 864000000; 
+const unsigned long INTERVALO_NTP = 86400000; 
 bool leituraSucesso = false;
 //
 WebServer server(80);
 Preferences prefs;
-// Pinos da Estufa
+// Pinos do controle da Estufa
 #define LED_BUILTIN_PIN 2     
 #define BTN_RESET        0    
 #define RELE_AQUECIMENTO 33   
@@ -29,7 +33,11 @@ Preferences prefs;
 #define LUZ_VERMELHA     26   
 #define LUZ_BRANCA2      12   
 #define LUZ_VIOLETA      13   
-// Sensores
+// Sensores e hardware
+#define SD_CS_PIN 5
+bool sdDisponivel = false;
+unsigned long ultimoTesteSD = 10000;
+bool ntpSincronizado = false;
 #define DHTPIN           25   
 #define DHTTYPE          DHT11
 DHT dht(DHTPIN, DHTTYPE);
@@ -83,21 +91,183 @@ int etapaUmidade = 0;
 bool estadoVentilar = false;
 bool estadoInjecaoCO2 = false;
 unsigned long cronometroUmidade = 0;
-// Buffer do monitor serial e captura de informações para log
-String serialBuffer = "";
-const size_t MAX_BUFFER_SIZE = 5000;
+// BUFFER CIRCULAR ESTÁTICO DO MONITOR SERIAL
+const size_t LOG_BUFFER_SIZE = 8192; // 8 KB fixos alocados na memória global
+char logBuffer[LOG_BUFFER_SIZE];
+size_t logHead = 0;
+bool logBufferCheio = false;
+// --- BUFFER DE ESCRITA EM LOTE DO CARTÃO SD (Batch Writing) ---
+const size_t SD_BATCH_SIZE = 512; // 512 bytes = 1 setor físico do SD
+char sdBatchBuffer[SD_BATCH_SIZE];
+size_t sdBatchPos = 0;
+unsigned long ultimoFlushSD = 0;
+const unsigned long INTERVALO_FLUSH_SD = 60000; // Flush automático a cada 60 segundos (60000 ms)
+// Captura de informações do cliente web
 String getClientDetails() {
   return " [IP: " + server.client().remoteIP().toString() + " | UA: " + server.header("User-Agent") + "]";
 }
-//
+// Adiciona a mensagem caractere por caractere ao buffer circular de forma ultrarrápida
+void adicionarAoBufferLog(const String& msg) {
+  for (size_t i = 0; i < msg.length(); i++) {
+    logBuffer[logHead] = msg[i];
+    logHead = (logHead + 1) % LOG_BUFFER_SIZE;
+    if (logHead == 0) logBufferCheio = true;
+  }
+  // Adiciona a quebra de linha no final da mensagem
+  logBuffer[logHead] = '\n';
+  logHead = (logHead + 1) % LOG_BUFFER_SIZE;
+  if (logHead == 0) logBufferCheio = true;
+}
+// Monta a string no formato correto escapando caracteres especiais para o JSON
+String getLogEscapedJSON() {
+  String out = "";
+  out.reserve(LOG_BUFFER_SIZE * 1.1); // Pre-aloca memória contígua uma única vez
+  size_t start = logBufferCheio ? logHead : 0;
+  size_t total = logBufferCheio ? LOG_BUFFER_SIZE : logHead;
+  for (size_t i = 0; i < total; i++) {
+    char c = logBuffer[(start + i) % LOG_BUFFER_SIZE];
+    if (c == '\\') out += "\\\\";
+    else if (c == '"') out += "\\\"";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') continue;
+    else out += c;
+  }
+  return out;
+}
+// Log do monitor serial e gravação no SD
 void logMessage(String msg) {
   Serial.println(msg);
-  serialBuffer += msg + "\n";
-  if (serialBuffer.length() > MAX_BUFFER_SIZE) {
-    serialBuffer = serialBuffer.substring(serialBuffer.length() - MAX_BUFFER_SIZE);
+  adicionarAoBufferLog(msg);
+  gravarLogSD(msg);
+}
+// Inicializa e verifica a presença do Cartão SD
+void inicializarSD() {
+  if (!SD.begin(SD_CS_PIN)) {
+    logMessage("[GREENHOUSE] Cartão SD não detectado! Operando apenas com memória RAM.");
+    sdDisponivel = false;
+    return;
+  }
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    logMessage("[SISTEMA] Erro de cartão no slot (precisa estar formatado em FAT32).");
+    sdDisponivel = false;
+    return;
+  }
+  logMessage("[SISTEMA] Cartão SD montado e pronto para uso.");
+  sdDisponivel = true;
+}
+// Gera o nome do arquivo log.txt para cartão sd usando o relógio NTP ou Tempo Ligado (uptime)
+String getNomeArquivoLog() {
+  // Se o NTP ainda não sincronizou, usa o nome por uptime
+  if (!ntpSincronizado) {
+    unsigned long diasUptime = millis() / 86400000UL;
+    char bufferSemData[32];
+    snprintf(bufferSemData, sizeof(bufferSemData), "/log_sem_data_%03lu.txt", diasUptime);
+    return String(bufferSemData);
+  }
+  // Se já sincronizou, lê o RTC interno na RAM (ultra rápido)
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+  char buffer[24];
+  strftime(buffer, sizeof(buffer), "/log%Y%m%d.txt", &timeinfo);
+  return String(buffer);
+}
+// Descarrega o lote acumulado na RAM fisicamente para o cartão SD
+void flushLogSD() {
+  if (sdBatchPos == 0 || !sdDisponivel) return;
+  String caminhoArquivo = getNomeArquivoLog();
+  File file = SD.open(caminhoArquivo.c_str(), FILE_APPEND);
+  if (file) {
+    file.write((uint8_t*)sdBatchBuffer, sdBatchPos);
+    file.close(); // Fecha o arquivo fisicamente no SD
+  } else {
+    Serial.print("[SISTEMA] Erro ao gravar buffer no SD: ");
+    Serial.println(caminhoArquivo);
+  }
+  sdBatchPos = 0;
+  ultimoFlushSD = millis();
+}
+// Checa se o tempo limite de 90 segundos expirou para descarregar o lote
+void verificarFlushSD() {
+  if (sdBatchPos > 0 && (millis() - ultimoFlushSD >= INTERVALO_FLUSH_SD)) {
+    flushLogSD();
   }
 }
-String getUptimeString() { // matemática do tempo ligado
+// Acumula as mensagens na RAM sem abrir o SD imediatamente
+void gravarLogSD(const String& mensagem) {
+  if (!sdDisponivel) return;
+  char timeStamp[25] = "[0000-00-00] ";
+  if (ntpSincronizado) {
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    strftime(timeStamp, sizeof(timeStamp), "[%Y-%m-%d ] ", &timeinfo);
+  }
+  String linhaFormatada = String(timeStamp) + mensagem + "\n";
+  size_t tamanhoLinha = linhaFormatada.length();
+  // Se a nova linha estourar o limite do setor (512 bytes), força a gravação no SD
+  if (sdBatchPos + tamanhoLinha >= SD_BATCH_SIZE) {
+    flushLogSD();
+  }
+  // Copia os caracteres para o buffer acumulador na RAM
+  for (size_t i = 0; i < tamanhoLinha; i++) {
+    sdBatchBuffer[sdBatchPos++] = linhaFormatada[i];
+  }
+}
+// Reconecta cartão SD em caso de falha
+void verificarReconexaoSD() {
+  // Se o SD caiu, tenta reconectar apenas 1 vez a cada 5 minutos
+  if (!sdDisponivel && (millis() - ultimoTesteSD > 300000)) {
+    ultimoTesteSD = millis();
+    if (SD.begin(SD_CS_PIN)) {
+      sdDisponivel = true;
+      Serial.println("[GREENHOUSE] Cartão reconectado com sucesso!");
+    }
+  }
+}
+// Remove logs com mais de X dias de idade para manter o SD interface web prática
+void limparLogsAntigos(int diasRetencao = 90) {
+  if (!sdDisponivel || !ntpSincronizado) return;
+  time_t now;
+  time(&now);
+  File root = SD.open("/");
+  File file = root.openNextFile();
+  while (file) {
+    if (!file.isDirectory()) {
+      String nome = String(file.name());
+      if (!nome.startsWith("/")) nome = "/" + nome;
+      // Processa apenas arquivos no formato /logYYYYMMDD.txt
+      if (nome.startsWith("/log20") && nome.endsWith(".txt") && nome.length() == 16) {
+        int ano = nome.substring(4, 8).toInt();
+        int mes = nome.substring(8, 10).toInt();
+        int dia = nome.substring(10, 12).toInt();
+        struct tm dataLog = {0};
+        dataLog.tm_year = ano - 1900;
+        dataLog.tm_mon = mes - 1;
+        dataLog.tm_mday = dia;
+        time_t tempoLog = mktime(&dataLog);
+        double diferencaDias = difftime(now, tempoLog) / 86400.0;
+        if (diferencaDias > diasRetencao) {
+          String caminhoParaDeletar = nome;
+          File proximo = root.openNextFile();
+          file.close();
+          SD.remove(caminhoParaDeletar);
+          logMessage("[SD] Log antigo removido automaticamente: " + caminhoParaDeletar);
+          file = proximo;
+          continue;
+        }
+      }
+    }
+    File proximo = root.openNextFile();
+    file.close();
+    file = proximo;
+  }
+}
+// matemática do tempo ligado
+String getUptimeString() { 
   unsigned long totalSegundos = millis() / 1000;
   unsigned long dias = totalSegundos / 86400;
   unsigned long horas = (totalSegundos % 86400) / 3600;
@@ -326,9 +496,13 @@ void handleDesbloquear() {
 void handleBloquear() {
   configuracoesDesbloqueadas = false;
   automacaoAtiva = true;
+  digitalWrite(RELE_UMIDADE_1, HIGH);
+  digitalWrite(RELE_UMIDADE_2, HIGH); 
+  etapaUmidade = 0;
   processarIluminacao();
   logMessage("[SEGURANÇA] Configurações bloqueadas manualmente." + getClientDetails());
   server.send(200, "text/plain", "OK");
+  delay(500);
 }
 // Comando do ciclo de iluminação
 void handleToggleCicloAuto() {
@@ -442,7 +616,7 @@ void handleSetUmidMin() {
       salvarPerfilAtivo(tempAlvo, umidMinima, cicloAuto, co2Alvo);
       logMessage("[CONFIG] Umidade Mínima alterada para " + String(umidMinima, 1) + "% no perfil " + perfilAtivo + getClientDetails());
     } else {
-      logMessage("[ERRO] Umidade fora dos limites de segurança (mínimo 10% a mínima + margem = 94%)!" + getClientDetails());
+      logMessage("[ERRO] Umidade fora dos limites de segurança (mínimo 10% a mínima + margem = 95%)!" + getClientDetails());
     }
   }
   server.send(200, "text/plain", "OK");
@@ -455,7 +629,7 @@ void handleSetUmidIdeal() {
       salvarParametrosGeraisPerfil();
       logMessage("[CONFIG] Margem de Desligamento de Umidade alterada para +" + String(umidIdeal, 1) + "%" + getClientDetails());
     } else {
-      logMessage("[ERRO] Margem de umidade fora dos limites (mínimo 0% a mínima + margem = 94%)!" + getClientDetails());
+      logMessage("[ERRO] Margem de umidade fora dos limites (mínimo 0% a mínima + margem = 95%)!" + getClientDetails());
     }
   }
   server.send(200, "text/plain", "OK");
@@ -482,9 +656,12 @@ void sincronizarNTP() {
     if (getLocalTime(&timeinfo)) {
       horaSimulada = timeinfo.tm_hour;
       minutoSimulado = timeinfo.tm_min;
-      tempoRelogio = millis(); 
+      tempoRelogio = millis();
+      ntpSincronizado = true;
       logMessage("[NTP] Hora oficial sincronizada com sucesso: " + getHoraSimuladaString());
+      limparLogsAntigos(); // Chama limpeza de logs antigos ao sincronizar relógio pela internet
     } else {
+      ntpSincronizado = false;
       logMessage("[NTP] Falha ao obter hora do servidor NTP.");
     }
   }
@@ -552,8 +729,102 @@ void handleRestart() {
   delay(100);
   ESP.restart();
 }
+// CONTROLADORES DE LOG WEB 1. Envia o log do dia atual direto como texto no navegador
+void handleLogHoje() {
+  String caminho = getNomeArquivoLog();
+  if (!SD.exists(caminho)) {
+    server.send(404, "text/plain", "Log de hoje ainda nao foi criado.");
+    return;   }
+  File file = SD.open(caminho, FILE_READ);
+  server.streamFile(file, "text/plain; charset=utf-8");
+  file.close();
+}
+// 2. Força o download do log do dia atual (.txt)
+void handleDownloadHoje() {
+  String caminho = getNomeArquivoLog();
+  if (!SD.exists(caminho)) {
+    server.send(404, "text/plain", "Log de hoje ainda nao foi criado.");
+    return;   }
+  File file = SD.open(caminho, FILE_READ);
+  String nomeDownload = caminho.substring(1); // Remove a barra '/' inicial
+  server.sendHeader("Content-Type", "text/plain");
+  server.sendHeader("Content-Disposition", "attachment; filename=" + nomeDownload);
+  server.streamFile(file, "application/octet-stream");
+  file.close();
+}
+// 3. API JSON que retorna a lista de arquivos salvos no SD
+void handleApiListarLogs() {
+  if (!sdDisponivel) {
+    server.send(500, "application/json", "[]");
+    return;
+  }
+  String json = "[";
+  File root = SD.open("/");
+  File file = root.openNextFile();
+  bool primeiro = true;
+  while (file) {
+    if (!file.isDirectory()) {
+      if (!primeiro) json += ",";
+      String nome = String(file.name());
+      if (!nome.startsWith("/")) nome = "/" + nome;
+      json += "{\"nome\":\"" + nome + "\",\"tamanho\":" + String(file.size()) + "}";
+      primeiro = false;
+    }
+  File proximo = root.openNextFile();
+  file.close(); // Fecha o arquivo processado antes de avançar
+  file = proximo;
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+// 4. Baixar ou visualizar qualquer arquivo específico passado via URL 
+void handleArquivoEspecifico() {
+  if (!server.hasArg("file")) {
+    server.send(400, "text/plain", "Parametro 'file' ausente.");
+    return;
+  }
+  String path = server.arg("file");
+  if (!SD.exists(path)) {
+    server.send(404, "text/plain", "Arquivo nao encontrado.");
+    return;
+  }
+  File file = SD.open(path, FILE_READ);
+  if (server.hasArg("download")) {
+    String nome = path.startsWith("/") ? path.substring(1) : path;
+    server.sendHeader("Content-Type", "text/plain");
+    server.sendHeader("Content-Disposition", "attachment; filename=" + nome);
+    server.streamFile(file, "application/octet-stream");
+  } else {
+    server.streamFile(file, "text/plain; charset=utf-8");
+  }
+  file.close();
+}
+// 5. Deletar arquivo
+ void handleDeletarArquivo(){
+  if (!configuracoesDesbloqueadas) {
+    server.send(403, "text/plain", "Bloqueado: Painel travado");
+    return;
+  }
+  if (server.hasArg("file")) {
+    String path = server.arg("file");
+    if (!path.startsWith("/")) path = "/" + path;
+    if (SD.exists(path)) {
+      if (SD.remove(path)) {
+        logMessage("Arquivo " + path + " removido via Web Interface." + getClientDetails());
+        server.send(200, "text/plain", "OK");
+      } else {
+        server.send(500, "text/plain", "Falha ao deletar arquivo");
+      }
+    } else {
+      server.send(404, "text/plain", "Arquivo nao encontrado");
+    }
+  } else {
+    server.send(400, "text/plain", "Parametro ausente");
+  }
+}
 // Atualizador de status e campos variáveis na interface web
 void handleStatus() {
+  String logEscaped = getLogEscapedJSON();
   String json = "{";
   json += "\"temp\":\"" + String(temperaturaAtual, 1) + "\",";
   json += "\"umid\":\"" + String(umidadeAtual, 1) + "\",";
@@ -583,362 +854,449 @@ void handleStatus() {
   json += "\"lB2\":" + String(digitalRead(LUZ_BRANCA2) == LOW ? "true" : "false") + ",";
   json += "\"lViol\":" + String(digitalRead(LUZ_VIOLETA) == LOW ? "true" : "false") + ",";
   json += "\"led\":" + String(digitalRead(LED_BUILTIN_PIN) == HIGH ? "true" : "false") + ",";
-  // Correção de caracteres de comando pra não bugar texto.
-  String logEscaped = serialBuffer;
-  logEscaped.replace("\\", "\\\\");
-  logEscaped.replace("\"", "\\\"");
-  logEscaped.replace("\n", "\\n");
-  logEscaped.replace("\r", "");
   json += "\"log\":\"" + logEscaped + "\"";
   json += "}";
   server.send(200, "application/json", json);
 }
 // Pagina web de interface
+const char WEB_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang='pt-BR'>
+<head>
+   <meta charset='UTF-8'>
+   <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+   <title>Greenhouse Link v2.35C</title>
+   <style>
+   body { font-family: Arial, sans-serif; background-color: #f0f2f5; margin: 20px; display: flex; flex-direction: column; gap: 20px; }
+   .box { background: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+   h2, h3, h4 { margin-top: 0; color: #2e7d32; font-size: 1.2rem; border-bottom: 2px solid #e8f5e9; padding-bottom: 8px; }
+   h4 { border-bottom: none; font-size: 1.0rem; margin-bottom: 8px; }
+   .sensor-row { display: flex; justify-content: space-around; flex-wrap: wrap; gap: 10px; background: #e8f5e9; padding: 15px; border-radius: 8px; margin-bottom: 10px; font-size: 1.2rem; font-weight: bold; color: #1b5e20; }
+   .clock-row { background: #e8f5e9; padding: 10px 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; color: #1b5e20; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+   .pin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }
+   .pin-btn { padding: 12px 8px; border-radius: 5px; color: white; font-weight: bold; text-align: center; border: none; width: 100%; font-size: 0.85rem; }
+   .clickable { cursor: pointer; transition: transform 0.1s; }
+   .clickable:hover { opacity: 0.85; transform: scale(1.02); }
+   .on { background-color: #28a745; box-shadow: 0 0 8px #28a745; } 
+   .off { background-color: #6c757d; } 
+   .btn-control { display: inline-block; padding: 12px 24px; font-size: 1rem; font-weight: bold; color: white; border-radius: 5px; border: none; cursor: pointer; }
+   .btn-pause { background-color: #dc3545; }
+   .btn-resume { background-color: #28a745; }
+   .config-info { background: #f8f9fa; padding: 12px; border-radius: 6px; margin: 15px 0; border-left: 4px solid #2e7d32; display: flex; flex-direction: column; gap: 6px; }
+   .profile-btns { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; }
+   .btn-profile { padding: 8px 16px; border: 1px solid #2e7d32; background: white; color: #2e7d32; border-radius: 4px; font-weight: bold; cursor: pointer; }
+   .btn-profile.active { background: #2e7d32; color: white; }
+   .btn-profile:disabled { opacity: 0.5; cursor: not-allowed; border-color: #ccc; color: #666; background: #eee; }
+   .input-group { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+   .input-group label { width: 240px; font-weight: bold; font-size: 0.9rem; }
+   .input-group input, .sub-box input, select { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }
+   .input-group .time-input { width: 50px; text-align: center; }
+   .btn-action { padding: 8px 16px; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin-right: 10px; }
+   .btn-action:disabled { background: #ccc !important; cursor: not-allowed; }
+   .sub-box { background: #f8f9fa; padding: 12px; border-radius: 6px; margin-top: 10px; border-left: 4px solid #2e7d32; }
+   .sub-box form { margin-bottom: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+   .dos-prompt { background-color: #000000; color: #00ff00; font-family: 'Courier New', Courier, monospace; 
+   padding: 15px; border-radius: 5px; height: 250px; overflow-y: auto; white-space: pre-wrap; font-size: 0.9rem; line-height: 1.2; }
+   </style>
+</head>
+<body>
+   <div class='box'>
+   <h2>1. Status da Estufa</h2>
+   <div class='sensor-row'>
+   <div>Temp: <span id='valTemp'>--</span> &deg;C</div>
+   <div>Umid: <span id='valUmid'>--</span> %</div>
+   <div>CO&sup2;: <span id='valCo2'>--</span> ppm</div>
+   </div>
+   <div class='clock-row'>
+   <div>Hora Simulada: <span id='valHora'>--:--</span></div>
+   <div>Tempo Ligado: <span id='valUptime'>000:00:00</span> <small style='font-size:0.75rem;'>(DDD:HH:MM)</small></div>
+   </div>
+   <div class='pin-grid'>
+   <button id='btnAq' class='pin-btn off' onclick='cliquePino(33)'>Aquecedor<br><small id='txtAq'>INATIVO</small></button>
+   <button id='btnVen' class='pin-btn off' onclick='cliquePino(32)'>Ventilador<br><small id='txtVen'>INATIVO</small></button>
+   <button id='btnRef' class='pin-btn off' onclick='cliquePino(16)'>Refrigeração<br><small id='txtRef'>INATIVO</small></button>
+   <button id='btnico2' class='pin-btn off' onclick='cliquePino(17)'>Injeção CO²<br><small id='txtico2'>INATIVO</small></button>
+   <button id='btnUm1' class='pin-btn off' onclick='cliquePino(4)'>Umidificador<br><small id='txtUm1'>INATIVO</small></button>
+   <button id='btnUm2' class='pin-btn off' onclick='cliquePino(14)'>Gatilho Umid.<br><small id='txtUm2'>INATIVO</small></button>
+   <button id='btnLB1' class='pin-btn off' onclick='cliquePino(27)'>Luz Branca 1<br><small id='txtLB1'>INATIVO</small></button>
+   <button id='btnLB2' class='pin-btn off' onclick='cliquePino(12)'>Luz Branca 2<br><small id='txtLB2'>INATIVO</small></button>
+   <button id='btnLVerm' class='pin-btn off' onclick='cliquePino(26)'>Luz Vermelha<br><small id='txtLVerm'>INATIVO</small></button>
+   <button id='btnLViol' class='pin-btn off' onclick='cliquePino(13)'>Luz Violeta<br><small id='txtLViol'>INATIVO</small></button>
+   <button id='btnLed' class='pin-btn off' onclick='cliquePino(2)'>Indicador LED<br><small id='txtLed'>INATIVO</small></button>
+  <!-- código criado por jimmy spada magave usando gemini -->
+   </div></div><div class='box'>
+  <h2>2. Monitor</h2>
+  <div class='dos-prompt' id='dosConsole'></div>
+  <!-- Botões de Ação Rápida -->
+  <div class="actions-bar" style="margin-top: 10px; display: flex; gap: 10px;">
+    <button onclick="carregarHistoricoSD()" class="btn-action" style='background:#007bff;'>CONSULTAR HISTÓRICO</button>
+  </div>
+  <!-- Tabela de Histórico (inicialmente oculta) -->
+  <div id="historicoContainer" style="display:none; margin-top: 15px;">
+    <h4>Arquivos Salvos no SD</h4>
+    <table id="tabelaLogs" style="width:100%; border-collapse: collapse;">
+      <thead>
+        <tr>
+          <th>Arquivo</th>
+          <th>Tamanho</th>
+          <th>Ações</th>
+        </tr>
+      </thead>
+      <tbody id="listaLogsBody"></tbody>
+    </table>
+  </div>
+</div>
+<script>
+// Função para carregar dinamicamente a lista de logs no SD
+var painelBloqueado = true; // Controla a exibição dos botões javascript na tela
+function carregarHistoricoSD() {
+  const container = document.getElementById('historicoContainer');
+  const tbody = document.getElementById('listaLogsBody');
+  // Alterna a exibição
+  if (container.style.display === 'block') {
+    container.style.display = 'none';
+    return;
+  }
+  fetch('/api/logs')
+    .then(response => response.json())
+    .then(data => {
+      tbody.innerHTML = '';
+      if (data.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="3">Histórico vazio ou cartão SD ausente.</td></tr>';
+      } else {
+        data.forEach(item => {
+          const kb = (item.tamanho / 1024).toFixed(1);
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td>${item.nome}</td>
+            <td>${kb} KB</td>
+            <td>
+              <a href="/arquivo?file=${item.nome}" target="_blank">Abrir</a> | 
+              <a href="/arquivo?file=${item.nome}&download=1">Baixar</a> | 
+              <a href="#" onclick="apagarArquivoSD('${item.nome}'); return false;" style="color: #d9534f; font-weight: bold;">Apagar</a>
+            </td>
+          `;
+          tbody.appendChild(tr);
+        });
+      }
+      container.style.display = 'block';
+    })
+    .catch(err => alert('Erro ao buscar histórico: ' + err));
+}
+// Função para apagar arquivo com validação do bloqueio do painel
+function apagarArquivoSD(nomeArquivo) {
+  // 1. Checa a trava no Frontend (utilize a variável global/função de verificação de bloqueio)
+  if(painelBloqueado) {
+    alert('Ação bloqueada! Desbloqueie o painel nas configurações para poder apagar arquivos.');
+    return;
+  }
+  // 2. Confirmação de segurança para evitar exclusão acidental
+  if (!confirm(`Deseja realmente apagar o arquivo "${nomeArquivo}" do cartão SD?`)) {
+    return;
+  }
+  // 3. Envia requisição via POST para o ESP32
+  fetch(`/deletar?file=${encodeURIComponent(nomeArquivo)}`, { method: 'POST' })
+    .then(response => {
+      if (response.ok) {
+        alert('Arquivo excluído com sucesso!');
+        // Atualiza a tabela recarregando a lista
+        document.getElementById('historicoContainer').style.display = 'none';
+        carregarHistoricoSD();
+      } else {
+        alert('Erro ao excluir arquivo no cartão SD.');
+      }
+    })
+    .catch(err => alert('Erro de conexão ao tentar apagar: ' + err));
+}
+</script>
+   </div>
+   <div class='box'>
+   <h2>3. Controle de Automação & Configuração</h2>
+   <div id='boxAutomacao'>Carregando status...</div>
+   <div class='config-info'>
+   <div><strong>Perfil Ativo:</strong> <span id='lblPerfil'>--</span></div>
+   <div><strong>Modo de Iluminação:</strong> <span id='lblModoIlu'>--</span></div>
+   <div><strong>Duração do Dia:</strong> <span id='lblDurDia'>--</span> h (Ancorado no Meio-Dia)</div>
+   <div><strong>Temp. Alvo:</strong> <span id='lblTAlvo'>--</span> &deg;C (&plusmn;<span id='lblTMargem'>--</span> &deg;C)</div>
+   <div><strong>CO² Alvo:</strong> <span id='lblico2Alvo'>--</span> ppm (&plusmn;<span id='lblico2Margem'>--</span> ppm)</div>
+   <div><strong>Umid. Mínima:</strong> <span id='lblUMin'>--</span> % (Desliga em <span id='lblUDesl'>--</span> % [Min + <span id='lblUIdeal'>--</span>%])</div>
+   <div><strong>Ciclo Dia/Noite:</strong> <span id='lblCAuto'>--</span></div>
+   </div>
+   <div style='font-size:0.9rem; font-weight:bold; margin-bottom:5px;'>Perfis Disponíveis:</div>
+   <div class='profile-btns'>
+   <button id='btnInc' class='btn-profile' onclick="setPerfil('inc')">Incubação</button>
+   <button id='btnFrut' class='btn-profile' onclick="setPerfil('frut')">Frutificação</button>
+   <button id='btnPers' class='btn-profile' onclick="setPerfil('pers')">Personalizado</button>
+   </div>
+   <div style='font-size:0.9rem; font-weight:bold; margin-bottom:10px;'>Ajuste Manual dos Parâmetros:</div>
+   <div class='input-group'>
+   <label for='inHora'>Definir hora simulada (HH:MM):</label>
+   <input type='number' id='inHora' class='time-input' min='0' max='23' placeholder='HH'> : 
+   <input type='number' id='inMin' class='time-input' min='0' max='59' placeholder='MM'> 
+   <button id='btnApplyHora' class='btn-action' style='background:#007bff;' onclick='aplicarHora()'>Aplicar Hora</button>
+   </div>
+   <div class='input-group'>
+   <label>Ciclo dia e noite simulada:</label>
+   <button id='btnToggleCiclo' class='btn-action' style='background:#007bff; margin:0;' onclick='toggleCicloAuto()'>--</button>
+   </div>
+   <div class='input-group'>
+   <label>Seletor de Modo de Ciclo do Dia:</label>
+   <button id='btnModoCog' class='btn-profile' onclick="setModoIlu('Cogumelos')">Cogumelos</button>
+   <button id='btnModoPlan' class='btn-profile' onclick="setModoIlu('Plantas')">Plantas</button>
+   </div>
+   <div class='input-group'>
+   <label for='inDur'>Duração do ciclo dia (horas):</label>
+   <input type='number' id='inDur' step='0.5' min='1.0' max='23.0' placeholder='Ex: 12.0'> 
+   <button id='btnApplyDur' class='btn-action' style='background:#007bff;' onclick='aplicarDuracao()'>Aplicar Duração</button>
+   </div>
+   <div class='input-group'>
+   <label for='inTemp'>Temp. Alvo (&deg;C):</label>
+   <input type='number' id='inTemp' step='0.5' placeholder='Ex: 22.0'> 
+   <button id='btnApplyTemp' class='btn-action' style='background:#007bff;' onclick='aplicarTemp()'>Aplicar</button>
+   </div>
+   <div class='input-group'>
+   <label for='inTMargem'>Margem Temp (&plusmn;&deg;C):</label>
+   <input type='number' id='inTMargem' step='0.1' min='0.5' max='5.0' placeholder='Ex: 1.0'> 
+   <button id='btnApplyTMargem' class='btn-action' style='background:#007bff;' onclick='aplicarTMargem()'>Aplicar</button>
+   </div>
+   <div class='input-group'>
+   <label for='inco2Alvo'>CO² Alvo (ppm):</label>
+   <input type='number' id='inco2Alvo' step='1.0' min='500.0' max='2000.0' placeholder='Ex: 800'> 
+   <button id='btnApplyco2Ideal' class='btn-action' style='background:#007bff;' onclick='aplicarco2Alvo()'>Aplicar</button>
+   </div>
+   <div class='input-group'>
+   <label for='inco2Margem'>Margem CO² (ppm):</label>
+   <input type='number' id='inco2Margem'  step='1.0' min='100.0' max='1000.0' placeholder='Ex: 500'> 
+   <button id='btnApplyco2Margem' class='btn-action' style='background:#007bff;' onclick='aplicarco2Margem()'>Aplicar</button>
+   </div>
+   <div class='input-group'>
+   <label for='inUmid'>Umid. Mínima (%):</label>
+   <input type='number' id='inUmid' step='1.0' placeholder='Ex: 90'> 
+   <button id='btnApplyUmid' class='btn-action' style='background:#007bff;' onclick='aplicarUmid()'>Aplicar</button>
+   </div>
+   <div class='input-group'>
+   <label for='inUmiIdeal'>Margem Desl. Umid (%):</label>
+   <input type='number' id='inUmiIdeal' step='0.5' min='0.0' max='20.0' placeholder='Ex: 5.0'> 
+   <button id='btnApplyUmiIdeal' class='btn-action' style='background:#007bff;' onclick='aplicarUmiIdeal()'>Aplicar</button>
+   </div>
+   <div class='input-group' style='margin-top:15px;'>
+   <label for='inNovaSenha'>Trocar senha de acesso:</label>
+   <input type='password' id='inNovaSenha' placeholder='********'> 
+   <button id='btnApplySenha' class='btn-action' style='background:#007bff;' onclick='aplicarSenha()'>Aplicar senha</button>
+   </div>
+   <div style='margin-top:15px;'>
+   <button id='btnReset' class='btn-action' style='background-color:#dc3545;' onclick='restaurarPerfil()'>Restaurar padrão de fábrica</button>
+   </div>
+   <p id='txtAviso' style='color:#dc3545; font-size:0.85rem; margin-top:10px;'></p>
+   </div>
+   <div class='box'>
+   <h2>4. Conectividade</h2>
+   <p><small style='color:#666;'>Nota: Para alterar o modo Wi-Fi ou credenciais, use os formulários abaixo e depois clique em Reiniciar ESP32.</small></p>
+   <div class='sub-box'>
+   <h4>Configuração AP (ponto de acesso wireless)</h4>
+   <form action='/set_ap_creds' method='POST'>
+   SSID AP: <input type='text' id='inApSsid' name='ssid' value='Greenhouse_AP'> 
+   Senha AP: <input type='password' id='inApPass' name='pass' placeholder='••••••••'> 
+   <button id='btnSaveAp' class='btn-action' style='background:#28a745;' type='submit'>Salvar AP</button>
+   </form>
+   </div>
+   <div class='sub-box'>
+   <h4>Configuração STA (modo Cliente Wi-Fi)</h4>
+   <form action='/set_sta_creds' method='POST'>
+   Rede Wi-Fi: <input type='text' id='inStaSsid' name='ssid' value=''> 
+   Senha Wi-Fi: <input type='password' id='inStaPass' name='pass' placeholder='********'> 
+   <button id='btnSaveSta' class='btn-action' style='background:#28a745;' type='submit'>Salvar conexão WLAN</button>
+   </form>
+   <p><small>Endereço local em modo Cliente: <b>http://greenhouse-link.local</b></small></p>
+   </div>
+   <div style='margin-top:15px; border-top:1px solid #eee; padding-top:10px;'>
+   <button id='btnRestart' class='btn-action' style='background-color:#ff9800;' onclick='reiniciarESP()'>Reiniciar ESP32</button>
+   <small style='color:#666;'>Use este botão para aplicar alterações de rede.</small>
+   </div></div>
+   <script> //parte que atualiza as informações variáveis da página
+   function atualizarStatus() {
+     fetch('/status').then(r => r.json()).then(d => {
+       document.getElementById('valTemp').innerText = d.temp;
+       document.getElementById('valUmid').innerText = d.umid;
+       document.getElementById('valCo2').innerText = d.co2;
+       document.getElementById('valHora').innerText = d.horaSim;
+       document.getElementById('valUptime').innerText = d.uptime;
+       document.getElementById('lblPerfil').innerText = d.perfil;
+       document.getElementById('lblModoIlu').innerText = d.modoIlu;
+       document.getElementById('lblDurDia').innerText = d.durDia;
+       document.getElementById('lblTAlvo').innerText = d.tAlvo;
+       document.getElementById('lblTMargem').innerText = d.tMargem;
+       document.getElementById('lblico2Alvo').innerText = d.ico2Alvo;
+       document.getElementById('lblico2Margem').innerText = d.ico2Margem;
+       document.getElementById('lblUMin').innerText = d.uMin;
+       document.getElementById('lblUIdeal').innerText = d.uIdeal;
+       document.getElementById('lblUDesl').innerText = (parseFloat(d.uMin) + parseFloat(d.uIdeal)).toFixed(1);
+       document.getElementById('lblCAuto').innerText = d.cAuto ? 'AUTOMÁTICO' : 'MANUAL';
+       let btnC = document.getElementById('btnToggleCiclo');
+       btnC.innerText = d.cAuto ? 'AUTOMÁTICO' : 'MANUAL';
+       btnC.style.backgroundColor = d.cAuto ? '#28a745' : '#6c757d';
+       let autoBox = document.getElementById('boxAutomacao');
+       let aviso = document.getElementById('txtAviso');
+       let lock = !d.unlocked;
+       painelBloqueado = lock;
+       if(!d.unlocked) {
+         autoBox.innerHTML = "<p>Estado Atual: <strong style='color:#28a745;'>AUTOMAÇÃO ATIVA</strong></p><button class='btn-control btn-pause' onclick='desbloquearConfig()'>Desbloquear configurações</button>";
+         aviso.innerText = '* Insira a senha para habilitar o painel de alteração de parâmetros e controle manual.';
+         } else {
+         autoBox.innerHTML = "<p>Estado Atual: <strong style='color:#dc3545;'>AUTOMAÇÃO INTERROMPIDA</strong></p><button class='btn-control btn-resume' onclick='bloquearConfig()'>Bloquear configurações</button>";
+         aviso.innerText = '';
+      }
+       document.getElementById('btnInc').className = 'btn-profile' + (d.perfil === 'Incubação' ? ' active' : '');
+       document.getElementById('btnFrut').className = 'btn-profile' + (d.perfil === 'Frutificação' ? ' active' : '');
+       document.getElementById('btnPers').className = 'btn-profile' + (d.perfil === 'Personalizado' ? ' active' : '');
+       document.getElementById('btnModoCog').className = 'btn-profile' + (d.modoIlu === 'Cogumelos' ? ' active' : '');
+       document.getElementById('btnModoPlan').className = 'btn-profile' + (d.modoIlu === 'Plantas' ? ' active' : '');
+       document.getElementById('btnInc').disabled = lock;
+       document.getElementById('btnFrut').disabled = lock;
+       document.getElementById('btnPers').disabled = lock;
+       document.getElementById('btnModoCog').disabled = lock;
+       document.getElementById('btnModoPlan').disabled = lock;
+       document.getElementById('btnToggleCiclo').disabled = lock;
+       document.getElementById('btnReset').disabled = lock;
+       document.getElementById('btnApplyHora').disabled = lock;
+       document.getElementById('btnApplyDur').disabled = lock;
+       document.getElementById('btnApplyTemp').disabled = lock;
+       document.getElementById('btnApplyTMargem').disabled = lock;
+       document.getElementById('btnApplyco2Margem').disabled = lock;
+       document.getElementById('btnApplyco2Ideal').disabled = lock;
+       document.getElementById('btnApplyUmid').disabled = lock;
+       document.getElementById('btnApplyUmiIdeal').disabled = lock;
+       document.getElementById('btnApplySenha').disabled = lock;
+       document.getElementById('inTemp').disabled = lock;
+       document.getElementById('inTMargem').disabled = lock;
+       document.getElementById('inco2Alvo').disabled = lock;
+       document.getElementById('inco2Margem').disabled = lock;
+       document.getElementById('inUmid').disabled = lock;
+       document.getElementById('inUmiIdeal').disabled = lock;
+       document.getElementById('inHora').disabled = lock;
+       document.getElementById('inMin').disabled = lock;
+       document.getElementById('inDur').disabled = lock;
+       document.getElementById('inNovaSenha').disabled = lock;
+       document.getElementById('inApSsid').disabled = lock;
+       document.getElementById('inApPass').disabled = lock;
+       document.getElementById('btnSaveAp').disabled = lock;
+       document.getElementById('inStaSsid').disabled = lock;
+       document.getElementById('inStaPass').disabled = lock;
+       document.getElementById('btnSaveSta').disabled = lock;
+       document.getElementById('btnRestart').disabled = lock;
+       function renderBtn(idBtn, idTxt, ativo, unlocked) {
+         let b = document.getElementById(idBtn);
+         let t = document.getElementById(idTxt);
+         b.className = 'pin-btn ' + (ativo ? 'on' : 'off') + (unlocked ? ' clickable' : '');
+         t.innerText = (ativo ? 'ATIVO' : 'INATIVO') + (unlocked ? ' (Clique)' : '');
+       }
+       renderBtn('btnAq', 'txtAq', d.aq, d.unlocked);
+       renderBtn('btnRef', 'txtRef', d.ref, d.unlocked);
+       renderBtn('btnico2', 'txtico2', d.ico2, d.unlocked);
+       renderBtn('btnVen', 'txtVen', d.ven, d.unlocked);
+       renderBtn('btnUm1', 'txtUm1', d.um1, d.unlocked);
+       renderBtn('btnUm2', 'txtUm2', d.um2, d.unlocked);
+       renderBtn('btnLB1', 'txtLB1', d.lB1, d.unlocked);
+       renderBtn('btnLVerm', 'txtLVerm', d.lVerm, d.unlocked);
+       renderBtn('btnLB2', 'txtLB2', d.lB2, d.unlocked);
+       renderBtn('btnLViol', 'txtLViol', d.lViol, d.unlocked);
+       renderBtn('btnLed', 'txtLed', d.led, d.unlocked);
+       let consoleDiv = document.getElementById('dosConsole');
+       let rolar = (consoleDiv.scrollHeight - consoleDiv.clientHeight <= consoleDiv.scrollTop + 20);
+       consoleDiv.innerText = d.log;
+       if(rolar) consoleDiv.scrollTop = consoleDiv.scrollHeight;
+     });
+   }
+function desbloquearConfig() {
+  let pass = prompt('Digite a senha de acesso:');
+  if(pass !== null && pass !== '') {
+    let formData = new FormData();
+    formData.append('pass', pass);
+    fetch('/desbloquear', { method: 'POST', body: formData })
+      .then(r => {
+        if(r.ok) { atualizarStatus(); } 
+        else { alert('Senha incorreta!'); atualizarStatus(); }
+      });
+  }
+}
+   function bloquearConfig() { fetch('/bloquear').then(() => atualizarStatus()); }
+   function cliquePino(p) { fetch('/togglePino?pin=' + p).then(() => atualizarStatus()); }
+   function setPerfil(p) { fetch('/setPerfil?p=' + p).then(() => atualizarStatus()); }
+   function toggleCicloAuto() { fetch('/toggleCicloAuto').then(() => atualizarStatus()); }
+   function setModoIlu(m) { fetch('/setModoIlu?m=' + m).then(() => atualizarStatus()); }
+   function aplicarTemp() {
+     let t = document.getElementById('inTemp').value;
+     if(t !== '') fetch('/setTempAlvo?t=' + t).then(() => { document.getElementById('inTemp').value = ''; atualizarStatus(); });
+   }
+   function aplicarTMargem() {
+     let tm = document.getElementById('inTMargem').value;
+     if(tm !== '') fetch('/setTempMargem?tm=' + tm).then(() => { document.getElementById('inTMargem').value = ''; atualizarStatus(); });
+   }
+   function aplicarco2Alvo() {
+     let co = document.getElementById('inco2Alvo').value;
+     if(co !== '') fetch('/setco2Alvo?co=' + co).then(() => { document.getElementById('inco2Alvo').value = ''; atualizarStatus(); });
+   }
+   function aplicarco2Margem() {
+     let com = document.getElementById('inco2Margem').value;
+     if(com !== '') fetch('/setco2Margem?com=' + com).then(() => { document.getElementById('inco2Margem').value = ''; atualizarStatus(); });
+   }
+   function aplicarUmid() {
+     let u = document.getElementById('inUmid').value;
+     if(u !== '') fetch('/setUmidMin?u=' + u).then(() => { document.getElementById('inUmid').value = ''; atualizarStatus(); });
+   }
+   function aplicarUmiIdeal() {
+     let ui = document.getElementById('inUmiIdeal').value;
+     if(ui !== '') fetch('/setUmidIdeal?ui=' + ui).then(() => { document.getElementById('inUmiIdeal').value = ''; atualizarStatus(); });
+   }
+function aplicarSenha() {
+  let p = document.getElementById('inNovaSenha').value;
+  if(p !== '') {
+    let formData = new FormData();
+    formData.append('pass', p);
+    fetch('/setSenha', { method: 'POST', body: formData })
+      .then(r => {
+        if(r.ok) { 
+          alert('Senha alterada com sucesso!'); 
+          document.getElementById('inNovaSenha').value = ''; 
+          atualizarStatus(); 
+        } else { 
+          alert('Erro: A senha precisa ter pelo menos 4 caracteres.'); 
+        }
+      });
+  }
+}
+   function restaurarPerfil() {
+     if(confirm('Restaurar o perfil ativo para as configurações de fábrica?')) {
+       fetch('/restaurarPerfil').then(() => atualizarStatus());
+     }
+   }
+   function aplicarHora() {
+     let h = document.getElementById('inHora').value;
+     let m = document.getElementById('inMin').value;
+     if(h !== '' && m !== '') fetch('/setHora?h=' + h + '&m=' + m).then(() => { document.getElementById('inHora').value=''; document.getElementById('inMin').value=''; atualizarStatus(); });
+   }
+   function aplicarDuracao() {
+     let d = document.getElementById('inDur').value;
+     if(d !== '') fetch('/setDuracaoDia?d=' + d).then(() => { document.getElementById('inDur').value=''; atualizarStatus(); });
+   }
+   function reiniciarESP32() {
+     if(confirm('Tem certeza de que deseja reiniciar o ESP32?')) {
+       fetch('/restart').then(() => alert('Comando de reinicialização enviado! Aguarde alguns instantes.'));
+     }
+   }
+   setInterval(atualizarStatus, 3000);
+   atualizarStatus();
+   </script>
+</body>
+</html>
+)rawliteral";
 void handleRoot() {
-  String html = "<!DOCTYPE html><html lang='pt-BR'><head>";
-  html += "<meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
-  html += "<title>Greenhouse Link v2.31B</title>";
-  html += "<style>";
-  html += "body { font-family: Arial, sans-serif; background-color: #f0f2f5; margin: 20px; display: flex; flex-direction: column; gap: 20px; }";
-  html += ".box { background: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }";
-  html += "h2, h3, h4 { margin-top: 0; color: #2e7d32; font-size: 1.2rem; border-bottom: 2px solid #e8f5e9; padding-bottom: 8px; }";
-  html += "h4 { border-bottom: none; font-size: 1.0rem; margin-bottom: 8px; }";
-  html += ".sensor-row { display: flex; justify-content: space-around; flex-wrap: wrap; gap: 10px; background: #e8f5e9; padding: 15px; border-radius: 8px; margin-bottom: 10px; font-size: 1.2rem; font-weight: bold; color: #1b5e20; }";
-  html += ".clock-row { background: #e8f5e9; padding: 10px 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; color: #1b5e20; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }";
-  html += ".pin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 10px; }";
-  html += ".pin-btn { padding: 12px 8px; border-radius: 5px; color: white; font-weight: bold; text-align: center; border: none; width: 100%; font-size: 0.85rem; }";
-  html += ".clickable { cursor: pointer; transition: transform 0.1s; }";
-  html += ".clickable:hover { opacity: 0.85; transform: scale(1.02); }";
-  html += ".on { background-color: #28a745; box-shadow: 0 0 8px #28a745; }"; 
-  html += ".off { background-color: #6c757d; }"; 
-  html += ".btn-control { display: inline-block; padding: 12px 24px; font-size: 1rem; font-weight: bold; color: white; border-radius: 5px; border: none; cursor: pointer; }";
-  html += ".btn-pause { background-color: #dc3545; }";
-  html += ".btn-resume { background-color: #28a745; }";
-  html += ".config-info { background: #f8f9fa; padding: 12px; border-radius: 6px; margin: 15px 0; border-left: 4px solid #2e7d32; display: flex; flex-direction: column; gap: 6px; }";
-  html += ".profile-btns { display: flex; gap: 10px; margin-bottom: 15px; flex-wrap: wrap; }";
-  html += ".btn-profile { padding: 8px 16px; border: 1px solid #2e7d32; background: white; color: #2e7d32; border-radius: 4px; font-weight: bold; cursor: pointer; }";
-  html += ".btn-profile.active { background: #2e7d32; color: white; }";
-  html += ".btn-profile:disabled { opacity: 0.5; cursor: not-allowed; border-color: #ccc; color: #666; background: #eee; }";
-  html += ".input-group { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }";
-  html += ".input-group label { width: 240px; font-weight: bold; font-size: 0.9rem; }";
-  html += ".input-group input, .sub-box input, select { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }";
-  html += ".input-group .time-input { width: 50px; text-align: center; }";
-  html += ".btn-action { padding: 8px 16px; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; margin-right: 10px; }";
-  html += ".btn-action:disabled { background: #ccc !important; cursor: not-allowed; }";
-  html += ".sub-box { background: #f8f9fa; padding: 12px; border-radius: 6px; margin-top: 10px; border-left: 4px solid #2e7d32; }";
-  html += ".sub-box form { margin-bottom: 8px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }";
-  html += ".dos-prompt { background-color: #000000; color: #00ff00; font-family: 'Courier New', Courier, monospace; ";
-  html += "padding: 15px; border-radius: 5px; height: 250px; overflow-y: auto; white-space: pre-wrap; font-size: 0.9rem; line-height: 1.2; }";
-  html += "</style></head><body>";
-  // CAIXA 1 
-  html += "<div class='box'>";
-  html += "<h2>1. Status da Estufa</h2>";
-  html += "<div class='sensor-row'>";
-  html += "<div>Temp: <span id='valTemp'>--</span> &deg;C</div>";
-  html += "<div>Umid: <span id='valUmid'>--</span> %</div>";
-  html += "<div>CO&sup2;: <span id='valCo2'>--</span> ppm</div>";
-  html += "</div>";
-  html += "<div class='clock-row'>";
-  html += "<div>Hora Simulada: <span id='valHora'>--:--</span></div>";
-  html += "<div>Tempo Ligado: <span id='valUptime'>000:00:00</span> <small style='font-size:0.75rem;'>(DDD:HH:MM)</small></div>";
-  html += "</div>";
-  html += "<div class='pin-grid'>";
-  html += "<button id='btnAq' class='pin-btn off' onclick='cliquePino(33)'>Aquecedor<br><small id='txtAq'>INATIVO</small></button>";
-  html += "<button id='btnVen' class='pin-btn off' onclick='cliquePino(32)'>Ventilador<br><small id='txtVen'>INATIVO</small></button>";
-  html += "<button id='btnRef' class='pin-btn off' onclick='cliquePino(16)'>Refrigeração<br><small id='txtRef'>INATIVO</small></button>";
-  html += "<button id='btnico2' class='pin-btn off' onclick='cliquePino(17)'>Injeção CO²<br><small id='txtico2'>INATIVO</small></button>";
-  html += "<button id='btnUm1' class='pin-btn off' onclick='cliquePino(4)'>Umidificador<br><small id='txtUm1'>INATIVO</small></button>";
-  html += "<button id='btnUm2' class='pin-btn off' onclick='cliquePino(14)'>Gatilho Umid.<br><small id='txtUm2'>INATIVO</small></button>";
-  html += "<button id='btnLB1' class='pin-btn off' onclick='cliquePino(27)'>Luz Branca 1<br><small id='txtLB1'>INATIVO</small></button>";
-  html += "<button id='btnLB2' class='pin-btn off' onclick='cliquePino(12)'>Luz Branca 2<br><small id='txtLB2'>INATIVO</small></button>";
-  html += "<button id='btnLVerm' class='pin-btn off' onclick='cliquePino(26)'>Luz Vermelha<br><small id='txtLVerm'>INATIVO</small></button>";
-  html += "<button id='btnLViol' class='pin-btn off' onclick='cliquePino(13)'>Luz Violeta<br><small id='txtLViol'>INATIVO</small></button>";
-  html += "<button id='btnLed' class='pin-btn off' onclick='cliquePino(2)'>Indicador LED<br><small id='txtLed'>INATIVO</small></button>";
-  html += "</div></div>";
-  // CAIXA 2
-  html += "<div class='box'>";
-  html += "<h2>2. Monitor</h2>";
-  html += "<div class='dos-prompt' id='dosConsole'></div>";
-  html += "</div>";
-  // CAIXA 3 
-  html += "<div class='box'>";
-  html += "<h2>3. Controle de Automação & Configuração</h2>";
-  html += "<div id='boxAutomacao'>Carregando status...</div>";
-  html += "<div class='config-info'>";
-  html += "<div><strong>Perfil Ativo:</strong> <span id='lblPerfil'>--</span></div>";
-  html += "<div><strong>Modo de Iluminação:</strong> <span id='lblModoIlu'>--</span></div>";
-  html += "<div><strong>Duração do Dia:</strong> <span id='lblDurDia'>--</span> h (Ancorado no Meio-Dia)</div>";
-  html += "<div><strong>Temp. Alvo:</strong> <span id='lblTAlvo'>--</span> &deg;C (&plusmn;<span id='lblTMargem'>--</span> &deg;C)</div>";
-  html += "<div><strong>CO² Alvo:</strong> <span id='lblico2Alvo'>--</span> ppm (&plusmn;<span id='lblico2Margem'>--</span> ppm)</div>";
-  html += "<div><strong>Umid. Mínima:</strong> <span id='lblUMin'>--</span> % (Desliga em <span id='lblUDesl'>--</span> % [Min + <span id='lblUIdeal'>--</span>%])</div>";
-  html += "<div><strong>Ciclo Dia/Noite:</strong> <span id='lblCAuto'>--</span></div>";
-  html += "</div>";
-  html += "<div style='font-size:0.9rem; font-weight:bold; margin-bottom:5px;'>Perfis Disponíveis:</div>";
-  html += "<div class='profile-btns'>";
-  html += "<button id='btnInc' class='btn-profile' onclick=\"setPerfil('inc')\">Incubação</button>";
-  html += "<button id='btnFrut' class='btn-profile' onclick=\"setPerfil('frut')\">Frutificação</button>";
-  html += "<button id='btnPers' class='btn-profile' onclick=\"setPerfil('pers')\">Personalizado</button>";
-  html += "</div>";
-  html += "<div style='font-size:0.9rem; font-weight:bold; margin-bottom:10px;'>Ajuste Manual dos Parâmetros:</div>";
-  html += "<div class='input-group'>";
-  html += "<label for='inHora'>Definir hora simulada (HH:MM):</label>";
-  html += "<input type='number' id='inHora' class='time-input' min='0' max='23' placeholder='HH'> : ";
-  html += "<input type='number' id='inMin' class='time-input' min='0' max='59' placeholder='MM'> ";
-  html += "<button id='btnApplyHora' class='btn-action' style='background:#007bff;' onclick='aplicarHora()'>Aplicar Hora</button>";
-  html += "</div>";
-  html += "<div class='input-group'>";
-  html += "<label>Ciclo dia e noite simulada:</label>";
-  html += "<button id='btnToggleCiclo' class='btn-action' style='background:#007bff; margin:0;' onclick='toggleCicloAuto()'>--</button>";
-  html += "</div>";
-  html += "<div class='input-group'>";
-  html += "<label>Seletor de Modo de Ciclo do Dia:</label>";
-  html += "<button id='btnModoCog' class='btn-profile' onclick=\"setModoIlu('Cogumelos')\">Cogumelos</button>";
-  html += "<button id='btnModoPlan' class='btn-profile' onclick=\"setModoIlu('Plantas')\">Plantas</button>";
-  html += "</div>";
-  html += "<div class='input-group'>";
-  html += "<label for='inDur'>Duração do ciclo dia (horas):</label>";
-  html += "<input type='number' id='inDur' step='0.5' min='1.0' max='23.0' placeholder='Ex: 12.0'> ";
-  html += "<button id='btnApplyDur' class='btn-action' style='background:#007bff;' onclick='aplicarDuracao()'>Aplicar Duração</button>";
-  html += "</div>";
-  html += "<div class='input-group'>";
-  html += "<label for='inTemp'>Temp. Alvo (&deg;C):</label>";
-  html += "<input type='number' id='inTemp' step='0.5' placeholder='Ex: 22.0'> ";
-  html += "<button id='btnApplyTemp' class='btn-action' style='background:#007bff;' onclick='aplicarTemp()'>Aplicar</button>";
-  html += "</div>";
-  html += "<div class='input-group'>";
-  html += "<label for='inTMargem'>Margem Temp (&plusmn;&deg;C):</label>";
-  html += "<input type='number' id='inTMargem' step='0.1' min='0.5' max='5.0' placeholder='Ex: 1.0'> ";
-  html += "<button id='btnApplyTMargem' class='btn-action' style='background:#007bff;' onclick='aplicarTMargem()'>Aplicar</button>";
-  html += "</div>";
-  html += "<div class='input-group'>";
-  html += "<label for='inco2Alvo'>CO² Alvo (ppm):</label>";
-  html += "<input type='number' id='inco2Alvo' step='1.0' min='500.0' max='2000.0' placeholder='Ex: 800'> ";
-  html += "<button id='btnApplyco2Ideal' class='btn-action' style='background:#007bff;' onclick='aplicarco2Alvo()'>Aplicar</button>";
-  html += "</div>";
-  html += "<div class='input-group'>";
-  html += "<label for='inco2Margem'>Margem CO² (ppm):</label>";
-  html += "<input type='number' id='inco2Margem'  step='1.0' min='100.0' max='1000.0' placeholder='Ex: 500'> ";
-  html += "<button id='btnApplyco2Margem' class='btn-action' style='background:#007bff;' onclick='aplicarco2Margem()'>Aplicar</button>";
-  html += "</div>";
-  html += "<div class='input-group'>";
-  html += "<label for='inUmid'>Umid. Mínima (%):</label>";
-  html += "<input type='number' id='inUmid' step='1.0' placeholder='Ex: 90'> ";
-  html += "<button id='btnApplyUmid' class='btn-action' style='background:#007bff;' onclick='aplicarUmid()'>Aplicar</button>";
-  html += "</div>";
-  html += "<div class='input-group'>";
-  html += "<label for='inUmiIdeal'>Margem Desl. Umid (%):</label>";
-  html += "<input type='number' id='inUmiIdeal' step='0.5' min='0.0' max='20.0' placeholder='Ex: 5.0'> ";
-  html += "<button id='btnApplyUmiIdeal' class='btn-action' style='background:#007bff;' onclick='aplicarUmiIdeal()'>Aplicar</button>";
-  html += "</div>";
-  html += "<div class='input-group' style='margin-top:15px;'>";
-  html += "<label for='inNovaSenha'>Trocar senha de acesso:</label>";
-  html += "<input type='password' id='inNovaSenha' placeholder='********'> ";
-  html += "<button id='btnApplySenha' class='btn-action' style='background:#007bff;' onclick='aplicarSenha()'>Aplicar senha</button>";
-  html += "</div>";
-  html += "<div style='margin-top:15px;'>";
-  html += "<button id='btnReset' class='btn-action' style='background-color:#dc3545;' onclick='restaurarPerfil()'>Restaurar padrão de fábrica</button>";
-  html += "</div>";
-  html += "<p id='txtAviso' style='color:#dc3545; font-size:0.85rem; margin-top:10px;'></p>";
-  html += "</div>";
-  // CAIXA 4
-  html += "<div class='box'>";
-  html += "<h2>4. Conectividade</h2>";
-  html += "<form action='/set_wifi_mode' method='POST'>";
-  html += "Modo de Operação: <select id='selWifiMode' name='mode' onchange='this.form.submit()'>";
-  html += "<option value='0'" + String(modoWifi == 0 ? " selected" : "") + ">Apenas Ponto de Acesso (AP)</option>";
-  html += "<option value='1'" + String(modoWifi == 1 ? " selected" : "") + ">Cliente Wi-Fi (STA + AP Automático)</option>";
-  html += "</select></form>";
-  html += "<div class='sub-box'>";
-  html += "<h4>Configuração AP (ponto de acesso wireless)</h4>";
-  html += "<form action='/set_ap_creds' method='POST'>";
-  html += "SSID AP: <input type='text' id='inApSsid' name='ssid' value='" + ssidAP + "'> ";
-  html += "Senha AP: <input type='password' id='inApPass' name='pass' placeholder='••••••••'> ";
-  html += "<button id='btnSaveAp' class='btn-action' style='background:#28a745;' type='submit'>Salvar AP</button>";
-  html += "</form>";
-  html += "</div>";
-  html += "<div class='sub-box'>";
-  html += "<h4>Configuração STA (modo Cliente Wi-Fi)</h4>";
-  html += "<form action='/set_sta_creds' method='POST'>";
-  html += "Rede Wi-Fi: <input type='text' id='inStaSsid' name='ssid' value='" + ssidSTA + "'> ";
-  html += "Senha Wi-Fi: <input type='password' id='inStaPass' name='pass' placeholder='********'> ";
-  html += "<button id='btnSaveSta' class='btn-action' style='background:#28a745;' type='submit'>Salvar conexão WLAN</button>";
-  html += "</form>";
-  html += "<p><small>Endereço local em modo Cliente: <b>http://greenhouse-link.local</b></small></p>";
-  html += "</div>";
-  html += "<div style='margin-top:15px; border-top:1px solid #eee; padding-top:10px;'>";
-  html += "<button id='btnRestart' class='btn-action' style='background-color:#ff9800;' onclick='reiniciarESP()'>Reiniciar ESP32</button>";
-  html += "<small style='color:#666;'>Use este botão para aplicar alterações de rede.</small>";
-  html += "</div></div>";
-  html += "<script>";
-  // Fim dos itens visuais concatenados e início da mecânica web
-  html += "function atualizarStatus() {";
-  html += "  fetch('/status').then(r => r.json()).then(d => {";
-  html += "    document.getElementById('valTemp').innerText = d.temp;";
-  html += "    document.getElementById('valUmid').innerText = d.umid;";
-  html += "    document.getElementById('valCo2').innerText = d.co2;";
-  html += "    document.getElementById('valHora').innerText = d.horaSim;";
-  html += "    document.getElementById('valUptime').innerText = d.uptime;";
-  html += "    document.getElementById('lblPerfil').innerText = d.perfil;";
-  html += "    document.getElementById('lblModoIlu').innerText = d.modoIlu;";
-  html += "    document.getElementById('lblDurDia').innerText = d.durDia;";
-  html += "    document.getElementById('lblTAlvo').innerText = d.tAlvo;";
-  html += "    document.getElementById('lblTMargem').innerText = d.tMargem;";
-  html += "    document.getElementById('lblico2Alvo').innerText = d.ico2Alvo;";
-  html += "    document.getElementById('lblico2Margem').innerText = d.ico2Margem;";
-  html += "    document.getElementById('lblUMin').innerText = d.uMin;";
-  html += "    document.getElementById('lblUIdeal').innerText = d.uIdeal;";
-  html += "    document.getElementById('lblUDesl').innerText = (parseFloat(d.uMin) + parseFloat(d.uIdeal)).toFixed(1);";
-  html += "    document.getElementById('lblCAuto').innerText = d.cAuto ? 'AUTOMÁTICO' : 'MANUAL';";
-  html += "    let btnC = document.getElementById('btnToggleCiclo');";
-  html += "    btnC.innerText = d.cAuto ? 'AUTOMÁTICO' : 'MANUAL';";
-  html += "    btnC.style.backgroundColor = d.cAuto ? '#28a745' : '#6c757d';";
-  html += "    let autoBox = document.getElementById('boxAutomacao');";
-  html += "    let aviso = document.getElementById('txtAviso');";
-  html += "    let lock = !d.unlocked;"; 
-  html += "    if(!d.unlocked) {";
-  html += "      autoBox.innerHTML = \"<p>Estado Atual: <strong style='color:#dc3545;'>CONFIGURAÇÕES BLOQUEADAS</strong></p><button class='btn-control btn-pause' onclick='desbloquearConfig()'>Desbloquear configurações</button>\";";
-  html += "      aviso.innerText = '* Insira a senha para habilitar o painel de alteração de parâmetros e controle manual.';";
-  html += "    } else {";
-  html += "      autoBox.innerHTML = \"<p>Estado Atual: <strong style='color:#28a745;'>CONFIGURAÇÕES DESBLOQUEADAS</strong></p><button class='btn-control btn-resume' onclick='bloquearConfig()'>Bloquear configurações</button>\";";
-  html += "      aviso.innerText = '';";
-  html += "    }";
-  html += "    document.getElementById('btnInc').className = 'btn-profile' + (d.perfil === 'Incubação' ? ' active' : '');";
-  html += "    document.getElementById('btnFrut').className = 'btn-profile' + (d.perfil === 'Frutificação' ? ' active' : '');";
-  html += "    document.getElementById('btnPers').className = 'btn-profile' + (d.perfil === 'Personalizado' ? ' active' : '');";
-  html += "    document.getElementById('btnModoCog').className = 'btn-profile' + (d.modoIlu === 'Cogumelos' ? ' active' : '');";
-  html += "    document.getElementById('btnModoPlan').className = 'btn-profile' + (d.modoIlu === 'Plantas' ? ' active' : '');";
-  html += "    document.getElementById('btnInc').disabled = lock;";
-  html += "    document.getElementById('btnFrut').disabled = lock;";
-  html += "    document.getElementById('btnPers').disabled = lock;";
-  html += "    document.getElementById('btnModoCog').disabled = lock;";
-  html += "    document.getElementById('btnModoPlan').disabled = lock;";
-  html += "    document.getElementById('btnToggleCiclo').disabled = lock;";
-  html += "    document.getElementById('btnReset').disabled = lock;";
-  html += "    document.getElementById('btnApplyHora').disabled = lock;";
-  html += "    document.getElementById('btnApplyDur').disabled = lock;";
-  html += "    document.getElementById('btnApplyTemp').disabled = lock;";
-  html += "    document.getElementById('btnApplyTMargem').disabled = lock;";
-  html += "    document.getElementById('btnApplyco2Margem').disabled = lock;";
-  html += "    document.getElementById('btnApplyco2Ideal').disabled = lock;";
-  html += "    document.getElementById('btnApplyUmid').disabled = lock;";
-  html += "    document.getElementById('btnApplyUmiIdeal').disabled = lock;";
-  html += "    document.getElementById('btnApplySenha').disabled = lock;";
-  html += "    document.getElementById('inTemp').disabled = lock;";
-  html += "    document.getElementById('inTMargem').disabled = lock;";
-  html += "    document.getElementById('inco2Alvo').disabled = lock;";
-  html += "    document.getElementById('inco2Margem').disabled = lock;";
-  html += "    document.getElementById('inUmid').disabled = lock;";
-  html += "    document.getElementById('inUmiIdeal').disabled = lock;";
-  html += "    document.getElementById('inHora').disabled = lock;";
-  html += "    document.getElementById('inMin').disabled = lock;";
-  html += "    document.getElementById('inDur').disabled = lock;";
-  html += "    document.getElementById('inNovaSenha').disabled = lock;";
-  html += "    document.getElementById('selWifiMode').disabled = lock;";
-  html += "    document.getElementById('inApSsid').disabled = lock;";
-  html += "    document.getElementById('inApPass').disabled = lock;";
-  html += "    document.getElementById('btnSaveAp').disabled = lock;";
-  html += "    document.getElementById('inStaSsid').disabled = lock;";
-  html += "    document.getElementById('inStaPass').disabled = lock;";
-  html += "    document.getElementById('btnSaveSta').disabled = lock;";
-  html += "    document.getElementById('btnRestart').disabled = lock;";
-  html += "    function renderBtn(idBtn, idTxt, ativo, unlocked) {";
-  html += "      let b = document.getElementById(idBtn);";
-  html += "      let t = document.getElementById(idTxt);";
-  html += "      b.className = 'pin-btn ' + (ativo ? 'on' : 'off') + (unlocked ? ' clickable' : '');";
-  html += "      t.innerText = (ativo ? 'ATIVO' : 'INATIVO') + (unlocked ? ' (Clique)' : '');";
-  html += "    }";
-  html += "    renderBtn('btnAq', 'txtAq', d.aq, d.unlocked);";
-  html += "    renderBtn('btnRef', 'txtRef', d.ref, d.unlocked);";
-  html += "    renderBtn('btnico2', 'txtico2', d.ico2, d.unlocked);";
-  html += "    renderBtn('btnVen', 'txtVen', d.ven, d.unlocked);";
-  html += "    renderBtn('btnUm1', 'txtUm1', d.um1, d.unlocked);";
-  html += "    renderBtn('btnUm2', 'txtUm2', d.um2, d.unlocked);";
-  html += "    renderBtn('btnLB1', 'txtLB1', d.lB1, d.unlocked);";
-  html += "    renderBtn('btnLVerm', 'txtLVerm', d.lVerm, d.unlocked);";
-  html += "    renderBtn('btnLB2', 'txtLB2', d.lB2, d.unlocked);";
-  html += "    renderBtn('btnLViol', 'txtLViol', d.lViol, d.unlocked);";
-  html += "    renderBtn('btnLed', 'txtLed', d.led, d.unlocked);";
-  html += "    let consoleDiv = document.getElementById('dosConsole');";
-  html += "    let rolar = (consoleDiv.scrollHeight - consoleDiv.clientHeight <= consoleDiv.scrollTop + 20);";
-  html += "    consoleDiv.innerText = d.log;";
-  html += "    if(rolar) consoleDiv.scrollTop = consoleDiv.scrollHeight;";
-  html += "  });";
-  html += "}";
-  html += "function desbloquearConfig() {";
-  html += "  let pass = prompt('Digite a senha de acesso:');";
-  html += "  if(pass !== null && pass !== '') {";
-  html += "    fetch('/desbloquear?pass=' + encodeURIComponent(pass)).then(r => {";
-  html += "      if(r.ok) { atualizarStatus(); } else { alert('Senha incorreta!'); atualizarStatus(); }";
-  html += "    });";
-  html += "  }";
-  html += "}";
-  html += "function bloquearConfig() { fetch('/bloquear').then(() => atualizarStatus()); }";
-  html += "function cliquePino(p) { fetch('/togglePino?pin=' + p).then(() => atualizarStatus()); }";
-  html += "function setPerfil(p) { fetch('/setPerfil?p=' + p).then(() => atualizarStatus()); }";
-  html += "function toggleCicloAuto() { fetch('/toggleCicloAuto').then(() => atualizarStatus()); }";
-  html += "function setModoIlu(m) { fetch('/setModoIlu?m=' + m).then(() => atualizarStatus()); }";
-  html += "function aplicarTemp() {";
-  html += "  let t = document.getElementById('inTemp').value;";
-  html += "  if(t !== '') fetch('/setTempAlvo?t=' + t).then(() => { document.getElementById('inTemp').value = ''; atualizarStatus(); });";
-  html += "}";
-  html += "function aplicarTMargem() {";
-  html += "  let tm = document.getElementById('inTMargem').value;";
-  html += "  if(tm !== '') fetch('/setTempMargem?tm=' + tm).then(() => { document.getElementById('inTMargem').value = ''; atualizarStatus(); });";
-  html += "}";
-  html += "function aplicarco2Alvo() {";
-  html += "  let co = document.getElementById('inco2Alvo').value;";
-  html += "  if(co !== '') fetch('/setco2Alvo?co=' + co).then(() => { document.getElementById('inco2Alvo').value = ''; atualizarStatus(); });";
-  html += "}";
-  html += "function aplicarco2Margem() {";
-  html += "  let com = document.getElementById('inco2Margem').value;";
-  html += "  if(com !== '') fetch('/setco2Margem?com=' + com).then(() => { document.getElementById('inco2Margem').value = ''; atualizarStatus(); });";
-  html += "}";
-  html += "function aplicarUmid() {";
-  html += "  let u = document.getElementById('inUmid').value;";
-  html += "  if(u !== '') fetch('/setUmidMin?u=' + u).then(() => { document.getElementById('inUmid').value = ''; atualizarStatus(); });";
-  html += "}";
-  html += "function aplicarUmiIdeal() {";
-  html += "  let ui = document.getElementById('inUmiIdeal').value;";
-  html += "  if(ui !== '') fetch('/setUmidIdeal?ui=' + ui).then(() => { document.getElementById('inUmiIdeal').value = ''; atualizarStatus(); });";
-  html += "}";
-  html += "function aplicarSenha() {";
-  html += "  let p = document.getElementById('inNovaSenha').value;";
-  html += "  if(p !== '') {";
-  html += "    fetch('/setSenha?pass=' + encodeURIComponent(p)).then(r => {";
-  html += "      if(r.ok) { alert('Senha alterada com sucesso!'); document.getElementById('inNovaSenha').value = ''; atualizarStatus(); }";
-  html += "      else { alert('Erro: A senha precisa ter pelo menos 4 caracteres.'); }";
-  html += "    });";
-  html += "  }";
-  html += "}";
-  html += "function restaurarPerfil() {";
-  html += "  if(confirm('Restaurar o perfil ativo para as configurações de fábrica?')) {";
-  html += "    fetch('/restaurarPerfil').then(() => atualizarStatus());";
-  html += "  }";
-  html += "}";
-  html += "function aplicarHora() {";
-  html += "  let h = document.getElementById('inHora').value;";
-  html += "  let m = document.getElementById('inMin').value;";
-  html += "  if(h !== '' && m !== '') fetch('/setHora?h=' + h + '&m=' + m).then(() => { document.getElementById('inHora').value=''; document.getElementById('inMin').value=''; atualizarStatus(); });";
-  html += "}";
-  html += "function aplicarDuracao() {";
-  html += "  let d = document.getElementById('inDur').value;";
-  html += "  if(d !== '') fetch('/setDuracaoDia?d=' + d).then(() => { document.getElementById('inDur').value=''; atualizarStatus(); });";
-  html += "}";
-  html += "function reiniciarESP() {";
-  html += "  if(confirm('Tem certeza de que deseja reiniciar o ESP32?')) {";
-  html += "    fetch('/restart').then(() => alert('Comando de reinicialização enviado! Aguarde alguns instantes.'));";
-  html += "  }";
-  html += "}";
-  html += "setInterval(atualizarStatus, 3000);";
-  html += "atualizarStatus();";
-  html += "</script>";
-  html += "</body></html>";
-  server.send(200, "text/html", html);
+  server.send_P(200, "text/html", WEB_PAGE);
 }
 //------------------------INICIO VOID SETUP
 void setup() {
   Serial.begin(115200); // Início da comunicação e configuração inicial dos pinos high = off
+  Serial.setTimeout(5);
   pinMode(LED_BUILTIN_PIN, OUTPUT);
   pinMode(BTN_RESET, INPUT_PULLUP);
   pinMode(RELE_AQUECIMENTO, OUTPUT);
@@ -963,6 +1321,8 @@ void setup() {
   digitalWrite(LUZ_VIOLETA, HIGH);
   delay(5000); // Pausa para conectar monitor serial cabeado
   logMessage("[GREENHOUSE] Sistema iniciando...");
+  inicializarSD();
+  delay(500);
   logMessage("[SISTEMA] Cultivo de " + modoIluminacao + " configurado.");
   // ---- AUTO-DETECÇÃO DE SENSOR (DHT11 ou SCD30) ----
   dht.begin();
@@ -976,7 +1336,7 @@ void setup() {
     if (airSensor.begin()) {
       usaSCD30 = true;
       airSensor.setMeasurementInterval(2);
-      logMessage("[SISTEMA] DHT11 não encontrado. Sensor SCD30 ativado com sucesso via I2C!");
+      logMessage("[SISTEMA] Sensor SCD30 ativado com sucesso via I2C!");
     } else {
       logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] ERRO: Falha de leitura no sensor de ambiente!");
     }
@@ -1008,11 +1368,15 @@ void setup() {
 // 
   const char* headerkeys[] = {"User-Agent"};
   server.collectHeaders(headerkeys, 1);
+  server.on("/log-hoje", handleLogHoje);
+  server.on("/download-hoje", handleDownloadHoje);
+  server.on("/api/logs", handleApiListarLogs);
+  server.on("/arquivo", handleArquivoEspecifico);
   server.on("/", handleRoot);
   server.on("/status", handleStatus);
-  server.on("/desbloquear", handleDesbloquear);
+  server.on("/desbloquear", HTTP_POST, handleDesbloquear);
   server.on("/bloquear", handleBloquear);
-  server.on("/setSenha", handleSetSenha);
+  server.on("/setSenha", HTTP_POST, handleSetSenha);
   server.on("/togglePino", handleTogglePino);
   server.on("/setPerfil", handleSetPerfil);
   server.on("/toggleCicloAuto", handleToggleCicloAuto);
@@ -1030,11 +1394,13 @@ void setup() {
   server.on("/set_ap_creds", HTTP_POST, handleSetApCreds);
   server.on("/set_sta_creds", HTTP_POST, handleSetStaCreds);
   server.on("/restart", handleRestart);
+  server.on("/deletar", HTTP_POST, handleDeletarArquivo);
   server.begin();
   logMessage("[GREENHOUSE] Web Server rodando na porta 80 padrão.");
 }
 //-----------------------INICIO VOID LOOP
 void loop() {
+  verificarFlushSD(); // Descarrega os logs para o SD a cada 90s se houver dados
   tempoAtual = millis(); // Atualiza o cronometro geral
 // Verifica a conexão e atualiza o relógio
   if (WiFi.status() == WL_CONNECTED) {
@@ -1149,23 +1515,30 @@ void loop() {
       // Loga os dados no console a cada 60 segundos
       if (tempoAtual - tempoLogSensor >= 60000 || tempoLogSensor == 0) {
         tempoLogSensor = tempoAtual;
+    if ((umidadeAtual == 0) && (temperaturaAtual == 0)) {logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Leitura indisponível! Aguardando próximo ciclo...");}
+    if ((umidadeAtual != 0) && (temperaturaAtual != 0)) {
         if (usaSCD30) {
           logMessage("[" + getHoraSimuladaString() + "] T:" + String(temperaturaAtual, 1) + "ºC | U:" + String(umidadeAtual, 0) + "% | CO2:" + String(co2Atual, 0) + "ppm");
         } else {
           logMessage("[" + getHoraSimuladaString() + "] T:" + String(temperaturaAtual, 1) + "ºC | U:" + String(umidadeAtual, 0) + "%");
-        }
+        }}
       }
     } else {
       // Se falhar, avisa a cada 10 segundos para não inundar o console
       if (tempoAtual - tempoLogSensor >= 10000 || tempoLogSensor == 0) {
-        tempoLogSensor = tempoAtual;
-        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor indisponível! Interrompendo atuadores de ambiente...");
-        digitalWrite(RELE_REFRIGERACAO, HIGH);
-        digitalWrite(RELE_INJECAO_CO2, HIGH);
-        digitalWrite(RELE_AQUECIMENTO, HIGH);
-        digitalWrite(RELE_VENTILADOR, HIGH);
-        digitalWrite(RELE_UMIDADE_1, HIGH);
-        digitalWrite(RELE_UMIDADE_2, HIGH);
+          tempoLogSensor = tempoAtual;
+         if (automacaoAtiva) {
+         logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor indisponível! Atuadores de ambiente interrompidos...");
+         digitalWrite(RELE_REFRIGERACAO, HIGH);
+         digitalWrite(RELE_INJECAO_CO2, HIGH);
+         digitalWrite(RELE_AQUECIMENTO, HIGH);
+         digitalWrite(RELE_VENTILADOR, HIGH);
+         digitalWrite(RELE_UMIDADE_1, HIGH);
+         digitalWrite(RELE_UMIDADE_2, HIGH); 
+         etapaUmidade = 0;
+        } else {
+         logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor indisponível! Aguardando nova leitura...");
+        }
       }
     }
   }
@@ -1174,44 +1547,49 @@ void loop() {
 	  if (tempoAtual - tempoLed >= 3000) { // tempo da rotina para executar itens dentro do loop
  	   tempoLed = tempoAtual;
  	   estadoLed = !estadoLed;
+     verificarReconexaoSD(); // Verifica se cartão SD precisa reconectar 
  	   if (!tentandoConectarWifi) {
  	     digitalWrite(LED_BUILTIN_PIN, estadoLed);
  	   }
     // Segurança dos atuadores em caso de falha (não atuam)
     if (leituraSucesso) {
     // Lógica de Temperatura
-      if (temperaturaAtual < (tempAlvo - tempMargem) && digitalRead(RELE_AQUECIMENTO) == HIGH) { 
-        digitalWrite(RELE_AQUECIMENTO, LOW);
-        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Baixa! Aquecimento LIGADO!");
-      } else if (temperaturaAtual >= tempAlvo && digitalRead(RELE_AQUECIMENTO) == LOW) { 
-        digitalWrite(RELE_AQUECIMENTO, HIGH);
-        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Alvo atingida. Aquecimento DESL.");
-      }
-      if (temperaturaAtual > (tempAlvo + tempMargem) && digitalRead(RELE_REFRIGERACAO) == HIGH) {
-        digitalWrite(RELE_REFRIGERACAO, LOW);
-        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Alta! Refrigeração LIGADA!");
-      } else if (temperaturaAtual <= tempAlvo && digitalRead(RELE_REFRIGERACAO) == LOW) {
-        digitalWrite(RELE_REFRIGERACAO, HIGH);
-        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Alvo atingida. Refrigeração DESL.");
+      if (temperaturaAtual != 0) { 
+        if (temperaturaAtual < (tempAlvo - tempMargem) && digitalRead(RELE_AQUECIMENTO) == HIGH) { 
+          digitalWrite(RELE_AQUECIMENTO, LOW);
+          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Baixa! Aquecimento LIGADO!");
+        } else if (temperaturaAtual >= tempAlvo && digitalRead(RELE_AQUECIMENTO) == LOW) { 
+          digitalWrite(RELE_AQUECIMENTO, HIGH);
+          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Alvo atingida. Aquecimento DESL.");
+        }
+        if (temperaturaAtual > (tempAlvo + tempMargem) && digitalRead(RELE_REFRIGERACAO) == HIGH) {
+          digitalWrite(RELE_REFRIGERACAO, LOW);
+          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Alta! Refrigeração LIGADA!");
+        } else if (temperaturaAtual <= tempAlvo && digitalRead(RELE_REFRIGERACAO) == LOW) {
+          digitalWrite(RELE_REFRIGERACAO, HIGH);
+          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Temp. Alvo atingida. Refrigeração DESL.");
+        }
       }
     // Lógica do controle de CO2
-      if (co2Atual > (co2Alvo + co2Margem) && digitalRead(RELE_VENTILADOR) == HIGH) {
-        estadoVentilar = true;
-        digitalWrite(RELE_VENTILADOR, LOW); 
-        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Nível de CO2 ELEVADO! Exaustão LIGADA!");
-      } else if (co2Atual <= co2Alvo && digitalRead(RELE_VENTILADOR) == LOW) {
-        estadoVentilar = false;
-        digitalWrite(RELE_VENTILADOR, HIGH);
-        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Nível de CO2 OK. Exaustão DESL.");
-      }
-      if (co2Atual < (co2Alvo - co2Margem) && digitalRead(RELE_INJECAO_CO2) == HIGH) {
-        estadoInjecaoCO2 = true;
-        digitalWrite(RELE_INJECAO_CO2, LOW);
-        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Nível de CO2 BAIXO! Injeção ATIVADA!");
-      } else if (co2Atual >= co2Alvo && digitalRead(RELE_INJECAO_CO2) == LOW) {
-        estadoInjecaoCO2 = false;
-        digitalWrite(RELE_INJECAO_CO2, HIGH);
-        logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] CO2 alvo alcançado. Injeção DESL.");
+      if (co2Atual>0){
+        if (co2Atual > (co2Alvo + co2Margem) && digitalRead(RELE_VENTILADOR) == HIGH) {
+          estadoVentilar = true;
+          digitalWrite(RELE_VENTILADOR, LOW); 
+          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Nível de CO2 ELEVADO! Exaustão LIGADA!");
+        } else if (co2Atual <= co2Alvo && digitalRead(RELE_VENTILADOR) == LOW) {
+          estadoVentilar = false;
+          digitalWrite(RELE_VENTILADOR, HIGH);
+          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Nível de CO2 OK. Exaustão DESL.");
+        }
+        if (co2Atual < (co2Alvo - co2Margem) && digitalRead(RELE_INJECAO_CO2) == HIGH) {
+          estadoInjecaoCO2 = true;
+          digitalWrite(RELE_INJECAO_CO2, LOW);
+          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Nível de CO2 BAIXO! Injeção ATIVADA!");
+        } else if (co2Atual >= co2Alvo && digitalRead(RELE_INJECAO_CO2) == LOW) {
+          estadoInjecaoCO2 = false;
+          digitalWrite(RELE_INJECAO_CO2, HIGH);
+          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] CO2 alvo alcançado. Injeção DESL.");
+        }
       }
       // Acionamento do umidificador
       if (umidadeAtual > 0) {
@@ -1232,8 +1610,14 @@ void loop() {
           }
         }
       }
+    }
+  }
     // Sequência de acionamento do umidificador e gatilho
     if (precisaUmidificar) {
+      if (digitalRead(RELE_UMIDADE_1) == HIGH) {
+          digitalWrite(RELE_UMIDADE_2, HIGH); 
+          etapaUmidade = 0;
+          }
       if (etapaUmidade == 0) {
         digitalWrite(RELE_UMIDADE_1, LOW); 
         cronometroUmidade = tempoAtual;    
@@ -1258,7 +1642,5 @@ void loop() {
         etapaUmidade = 0;
         } 
       }
-    }
-  }
 }
 }
