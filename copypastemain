@@ -27,7 +27,8 @@ Preferences prefs;
 #define RELE_UMIDADE_1   4    
 #define RELE_UMIDADE_2   14   
 #define RELE_REFRIGERACAO 16 // pino RX2
-#define RELE_INJECAO_CO2 17 // pino TX2
+#define RELE_INJECAO_CO2 17 // pino TX2// --- PINO E PARÂMETROS DA IRRIGAÇÃO DO SOLO ---
+#define RELE_IRRIGACAO 15          // GPIO escolhido para o relé de irrigação
 // Pinos de Iluminação Progressiva
 #define LUZ_BRANCA1      27   
 #define LUZ_VERMELHA     26   
@@ -41,6 +42,14 @@ bool ntpSincronizado = false;
 #define DHTPIN           25   
 #define DHTTYPE          DHT11
 DHT dht(DHTPIN, DHTTYPE);
+#define SENSOR_SOLO_PIN 34 // --- SENSOR DE UMIDADE DO SOLO (GPIO 34 - ADC1) ---
+bool soloDisponivel = false;
+int usMin = 3000;          // Valor bruto padrão para solo seco (Calibrável)
+int usMax = 1200;          // Valor bruto padrão para solo úmido (Calibrável)
+float umidadeSoloPerc = 0.0; // Valor percentual final para o painel
+unsigned long tempoAmostraSolo = 0;
+long acumuladorSolo = 0;
+int amostrasSoloCount = 0;
 SCD30 airSensor;
 bool usaDHT11 = false;
 bool usaSCD30 = false;
@@ -70,6 +79,8 @@ float umidIdeal = 5.0;      // Margem de umidade acima do mínimo para desligar
 float tempMargem = 1.0;     // Margem/histerese de temperatura ajustável
 float co2Alvo = 1000;       // Valor padrão desejado em ppm
 float co2Margem = 700;      // Margem de oscilação em ppm
+float usAlvo = 60.0;        // Umidade do solo desejada em %
+float usMargem = 10.0;      // Margem de histerese para ligar/desligar (%)
 bool cicloAuto = true;      
 String modoIluminacao = "Cogumelos"; 
 float duracaoDia = 12.0;             
@@ -363,7 +374,11 @@ void carregarPerfil(String perfil) {
     umidMinima = prefs.getFloat("pers_u", 75.0);
     cicloAuto = prefs.getBool("pers_c", true);
     co2Alvo = prefs.getFloat("pers_co", 800.0);
-  } 
+  }
+  usAlvo = prefs.getFloat("us_alvo", 60.0);
+  usMargem = prefs.getFloat("us_margem", 10.0);
+  usMin = prefs.getInt("us_min", 3000);
+  usMax = prefs.getInt("us_max", 1200);
   umidIdeal = prefs.getFloat("umid_ideal", 5.0);
   tempMargem = prefs.getFloat("temp_margem", 1.0);
   modoIluminacao = prefs.getString("modo_ilu", "Cogumelos");
@@ -401,6 +416,14 @@ void salvarPerfilAtivo(float t, float u, bool c, float co) {
   umidMinima = u;
   cicloAuto = c;
   co2Alvo = co;
+}
+void salvarParametrosSolo() {
+  prefs.begin("greenhouse", false);
+  prefs.putFloat("us_alvo", usAlvo);
+  prefs.putFloat("us_margem", usMargem);
+  prefs.putInt("us_min", usMin);
+  prefs.putInt("us_max", usMax);
+  prefs.end();
 }
 void salvarParametrosGeraisPerfil() {
   prefs.begin("greenhouse", false);
@@ -648,6 +671,60 @@ void handleSetHora() {
   }
   server.send(200, "text/plain", "OK");
 }
+// Calibra o ponto Seco (0%) usando a leitura atual do sensor
+void handleCalibrarSeco() {
+  if (configuracoesDesbloqueadas) {
+    usMin = analogRead(SENSOR_SOLO_PIN);
+    salvarParametrosSolo();
+    logMessage("[CALIBRAÇÃO] Ponto Seco (0%) definido para U. Solo: " + String(usMin) + getClientDetails());
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(403, "text/plain", "Acesso Negado");
+  }
+}
+// Calibra o ponto Úmido (100%) usando a leitura atual do sensor
+void handleCalibrarUmido() {
+  if (configuracoesDesbloqueadas) {
+    usMax = analogRead(SENSOR_SOLO_PIN);
+    salvarParametrosSolo();
+    logMessage("[CALIBRAÇÃO] Ponto Úmido (100%) definido para sensor U. Solo: " + String(usMax) + getClientDetails());
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(403, "text/plain", "Acesso Negado");
+  }
+}
+// Definir umidade alvo do solo
+void handleSetUmidSoloAlvo() {
+  if (configuracoesDesbloqueadas && server.hasArg("usa")) {
+    float val = server.arg("usa").toFloat();
+    if (val >= 0.0 && val <= 100.0) {
+      usAlvo = val;
+      salvarParametrosSolo();
+      logMessage("[CONFIG] Umidade do Solo Alvo alterada para " + String(usAlvo, 1) + "%" + getClientDetails());
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(400, "text/plain", "Valor invalido");
+    }
+  } else {
+    server.send(403, "text/plain", "Acesso Negado");
+  }
+}
+// Definir margem de umidade do solo para acionar irrigação
+void handleSetUmidSoloMargem() {
+  if (configuracoesDesbloqueadas && server.hasArg("usm")) {
+    float val = server.arg("usm").toFloat();
+    if (val >= 1.0 && val <= 30.0) {
+      usMargem = val;
+      salvarParametrosSolo();
+      logMessage("[CONFIG] Margem do Solo alterada para " + String(usMargem, 1) + "%" + getClientDetails());
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(400, "text/plain", "Valor invalido");
+    }
+  } else {
+    server.send(403, "text/plain", "Acesso Negado");
+  }
+}
 // Ajuste automático do relógio via NTP (quando conectado a internet)
 void sincronizarNTP() {
   if (WiFi.status() == WL_CONNECTED) {
@@ -829,6 +906,9 @@ void handleStatus() {
   json += "\"temp\":\"" + String(temperaturaAtual, 1) + "\",";
   json += "\"umid\":\"" + String(umidadeAtual, 1) + "\",";
   json += "\"co2\":\"" + String(co2Atual, 0) + "\",";
+  json += "\"umidSolo\":\"" + String(umidadeSoloPerc, 1) + "\",";
+  json += "\"usAlvo\":\"" + String(usAlvo, 1) + "\",";
+  json += "\"usMargem\":\"" + String(usMargem, 1) + "\",";
   json += "\"horaSim\":\"" + getHoraSimuladaString() + "\",";
   json += "\"uptime\":\"" + getUptimeString() + "\",";
   json += "\"tAlvo\":\"" + String(tempAlvo, 1) + "\",";
@@ -854,6 +934,7 @@ void handleStatus() {
   json += "\"lB2\":" + String(digitalRead(LUZ_BRANCA2) == LOW ? "true" : "false") + ",";
   json += "\"lViol\":" + String(digitalRead(LUZ_VIOLETA) == LOW ? "true" : "false") + ",";
   json += "\"led\":" + String(digitalRead(LED_BUILTIN_PIN) == HIGH ? "true" : "false") + ",";
+  json += "\"irrig\":" + String(digitalRead(RELE_IRRIGACAO) == LOW ? "true" : "false") + ",";
   json += "\"log\":\"" + logEscaped + "\"";
   json += "}";
   server.send(200, "application/json", json);
@@ -865,7 +946,7 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
 <head>
    <meta charset='UTF-8'>
    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
-   <title>Greenhouse Link v2.35C</title>
+   <title>Greenhouse Link v2.36C</title>
    <style>
    body { font-family: Arial, sans-serif; background-color: #f0f2f5; margin: 20px; display: flex; flex-direction: column; gap: 20px; }
    .box { background: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
@@ -904,8 +985,9 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
    <h2>1. Status da Estufa</h2>
    <div class='sensor-row'>
    <div>Temp: <span id='valTemp'>--</span> &deg;C</div>
-   <div>Umid: <span id='valUmid'>--</span> %</div>
+   <div>Umid. Ar: <span id='valUmid'>--</span> %</div>
    <div>CO&sup2;: <span id='valCo2'>--</span> ppm</div>
+   <div>Umid. Solo: <span id='valUmidSolo'>--</span> %</div>
    </div>
    <div class='clock-row'>
    <div>Hora Simulada: <span id='valHora'>--:--</span></div>
@@ -923,7 +1005,8 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
    <button id='btnLVerm' class='pin-btn off' onclick='cliquePino(26)'>Luz Vermelha<br><small id='txtLVerm'>INATIVO</small></button>
    <button id='btnLViol' class='pin-btn off' onclick='cliquePino(13)'>Luz Violeta<br><small id='txtLViol'>INATIVO</small></button>
    <button id='btnLed' class='pin-btn off' onclick='cliquePino(2)'>Indicador LED<br><small id='txtLed'>INATIVO</small></button>
-  <!-- código criado por jimmy spada magave usando gemini -->
+   <button id='btnIrrig' class='pin-btn off' onclick='cliquePino(15)'>Irrigação<br><small id='txtIrrigacao'>INATIVO</small></button>
+  <!-- DEUS SEJA LOUVADO! - código criado por jimmy spada magave usando gemini basico-->
    </div></div><div class='box'>
   <h2>2. Monitor</h2>
   <div class='dos-prompt' id='dosConsole'></div>
@@ -1019,7 +1102,8 @@ function apagarArquivoSD(nomeArquivo) {
    <div><strong>Duração do Dia:</strong> <span id='lblDurDia'>--</span> h (Ancorado no Meio-Dia)</div>
    <div><strong>Temp. Alvo:</strong> <span id='lblTAlvo'>--</span> &deg;C (&plusmn;<span id='lblTMargem'>--</span> &deg;C)</div>
    <div><strong>CO² Alvo:</strong> <span id='lblico2Alvo'>--</span> ppm (&plusmn;<span id='lblico2Margem'>--</span> ppm)</div>
-   <div><strong>Umid. Mínima:</strong> <span id='lblUMin'>--</span> % (Desliga em <span id='lblUDesl'>--</span> % [Min + <span id='lblUIdeal'>--</span>%])</div>
+   <div><strong>Umid. Ar Mínima:</strong> <span id='lblUMin'>--</span> % (Desliga Umidificador em <span id='lblUDesl'>--</span> % [Min + <span id='lblUIdeal'>--</span>%])</div>
+   <div><strong>Umid. Solo Mínima:</strong> <span id='lblUSoloMin'>--</span> % (Desliga Irrigação em <span id='lblUSoloDesl'>--</span> % [Min + <span id='lblUSoloIdeal'>--</span>%])</div>
    <div><strong>Ciclo Dia/Noite:</strong> <span id='lblCAuto'>--</span></div>
    </div>
    <div style='font-size:0.9rem; font-weight:bold; margin-bottom:5px;'>Perfis Disponíveis:</div>
@@ -1079,6 +1163,21 @@ function apagarArquivoSD(nomeArquivo) {
    <input type='number' id='inUmiIdeal' step='0.5' min='0.0' max='20.0' placeholder='Ex: 5.0'> 
    <button id='btnApplyUmiIdeal' class='btn-action' style='background:#007bff;' onclick='aplicarUmiIdeal()'>Aplicar</button>
    </div>
+   <div class='input-group'>
+   <label>Calibração do Sensor de Solo:</label>
+   <button id='btnCalSeco' class='btn-action' style='background:#ff9800;' onclick='calibrarSolo("Seco")'>Calibrar Ponto Seco (0%)</button>
+   <button id='btnCalUmido' class='btn-action' style='background:#007bff;' onclick='calibrarSolo("Umido")'>Calibrar Ponto Úmido (100%)</button>
+   </div>
+   <div class='input-group'>
+   <label for='inUsAlvo'>Umidade do Solo Alvo (%):</label>
+   <input type='number' id='inUsAlvo' step='1.0' min='0' max='100' placeholder='Ex: 60'> 
+   <button id='btnApplyUsAlvo' class='btn-action' style='background:#007bff;' onclick='aplicarUsAlvo()'>Aplicar</button>
+   </div>
+   <div class='input-group'>
+   <label for='inUsMargem'>Margem de Solo (&plusmn;%):</label>
+   <input type='number' id='inUsMargem' step='1.0' min='1' max='50' placeholder='Ex: 10'> 
+   <button id='btnApplyUsMargem' class='btn-action' style='background:#007bff;' onclick='aplicarUsMargem()'>Aplicar</button>
+   </div>
    <div class='input-group' style='margin-top:15px;'>
    <label for='inNovaSenha'>Trocar senha de acesso:</label>
    <input type='password' id='inNovaSenha' placeholder='********'> 
@@ -1110,7 +1209,7 @@ function apagarArquivoSD(nomeArquivo) {
    <p><small>Endereço local em modo Cliente: <b>http://greenhouse-link.local</b></small></p>
    </div>
    <div style='margin-top:15px; border-top:1px solid #eee; padding-top:10px;'>
-   <button id='btnRestart' class='btn-action' style='background-color:#ff9800;' onclick='reiniciarESP()'>Reiniciar ESP32</button>
+   <button id='btnRestart' class='btn-action' style='background-color:#ff9800;' onclick='reiniciarESP32()'>Reiniciar ESP32</button>
    <small style='color:#666;'>Use este botão para aplicar alterações de rede.</small>
    </div></div>
    <script> //parte que atualiza as informações variáveis da página
@@ -1119,6 +1218,7 @@ function apagarArquivoSD(nomeArquivo) {
        document.getElementById('valTemp').innerText = d.temp;
        document.getElementById('valUmid').innerText = d.umid;
        document.getElementById('valCo2').innerText = d.co2;
+       document.getElementById('valUmidSolo').innerText = d.umidSolo;
        document.getElementById('valHora').innerText = d.horaSim;
        document.getElementById('valUptime').innerText = d.uptime;
        document.getElementById('lblPerfil').innerText = d.perfil;
@@ -1130,7 +1230,12 @@ function apagarArquivoSD(nomeArquivo) {
        document.getElementById('lblico2Margem').innerText = d.ico2Margem;
        document.getElementById('lblUMin').innerText = d.uMin;
        document.getElementById('lblUIdeal').innerText = d.uIdeal;
-       document.getElementById('lblUDesl').innerText = (parseFloat(d.uMin) + parseFloat(d.uIdeal)).toFixed(1);
+       document.getElementById('lblUDesl').innerText = (parseFloat(d.uMin) + parseFloat(d.uIdeal)).toFixed(1);let usAlvoVal = parseFloat(d.usAlvo);
+       let usMargemVal = parseFloat(d.usMargem);
+       let usMinVal = usAlvoVal - usMargemVal;
+       document.getElementById('lblUSoloMin').innerText = usMinVal.toFixed(1);
+       document.getElementById('lblUSoloIdeal').innerText = usMargemVal.toFixed(1);
+       document.getElementById('lblUSoloDesl').innerText = usAlvoVal.toFixed(1);
        document.getElementById('lblCAuto').innerText = d.cAuto ? 'AUTOMÁTICO' : 'MANUAL';
        let btnC = document.getElementById('btnToggleCiclo');
        btnC.innerText = d.cAuto ? 'AUTOMÁTICO' : 'MANUAL';
@@ -1166,6 +1271,10 @@ function apagarArquivoSD(nomeArquivo) {
        document.getElementById('btnApplyco2Ideal').disabled = lock;
        document.getElementById('btnApplyUmid').disabled = lock;
        document.getElementById('btnApplyUmiIdeal').disabled = lock;
+       document.getElementById('btnCalSeco').disabled = lock;
+       document.getElementById('btnCalUmido').disabled = lock;
+       document.getElementById('btnApplyUsAlvo').disabled = lock;
+       document.getElementById('btnApplyUsMargem').disabled = lock;
        document.getElementById('btnApplySenha').disabled = lock;
        document.getElementById('inTemp').disabled = lock;
        document.getElementById('inTMargem').disabled = lock;
@@ -1173,6 +1282,8 @@ function apagarArquivoSD(nomeArquivo) {
        document.getElementById('inco2Margem').disabled = lock;
        document.getElementById('inUmid').disabled = lock;
        document.getElementById('inUmiIdeal').disabled = lock;
+       document.getElementById('inUsAlvo').disabled = lock;
+       document.getElementById('inUsMargem').disabled = lock;
        document.getElementById('inHora').disabled = lock;
        document.getElementById('inMin').disabled = lock;
        document.getElementById('inDur').disabled = lock;
@@ -1201,6 +1312,7 @@ function apagarArquivoSD(nomeArquivo) {
        renderBtn('btnLB2', 'txtLB2', d.lB2, d.unlocked);
        renderBtn('btnLViol', 'txtLViol', d.lViol, d.unlocked);
        renderBtn('btnLed', 'txtLed', d.led, d.unlocked);
+       renderBtn('btnIrrig', 'txtIrrigacao', d.irrig, d.unlocked);
        let consoleDiv = document.getElementById('dosConsole');
        let rolar = (consoleDiv.scrollHeight - consoleDiv.clientHeight <= consoleDiv.scrollTop + 20);
        consoleDiv.innerText = d.log;
@@ -1248,6 +1360,23 @@ function desbloquearConfig() {
      let ui = document.getElementById('inUmiIdeal').value;
      if(ui !== '') fetch('/setUmidIdeal?ui=' + ui).then(() => { document.getElementById('inUmiIdeal').value = ''; atualizarStatus(); });
    }
+   function calibrarSolo(tipo) {
+  if(confirm(`Posicione o sensor no solo "${tipo}" e confirme para registrar a referência.`)) {
+    fetch('/calibrar' + tipo, { method: 'POST' }).then(r => {
+      if(r.ok) alert(`Ponto ${tipo} calibrado com sucesso!`);
+      else alert('Erro ao calibrar.');
+      atualizarStatus();
+    });
+  }
+}
+function aplicarUsAlvo() {
+  let v = document.getElementById('inUsAlvo').value;
+  if(v !== '') fetch('/setUmidSoloAlvo?usa=' + v, { method: 'POST' }).then(() => { document.getElementById('inUsAlvo').value = ''; atualizarStatus(); });
+}
+function aplicarUsMargem() {
+  let v = document.getElementById('inUsMargem').value;
+  if(v !== '') fetch('/setUmidSoloMargem?usm=' + v, { method: 'POST' }).then(() => { document.getElementById('inUsMargem').value = ''; atualizarStatus(); });
+}
 function aplicarSenha() {
   let p = document.getElementById('inNovaSenha').value;
   if(p !== '') {
@@ -1297,6 +1426,7 @@ void handleRoot() {
 void setup() {
   Serial.begin(115200); // Início da comunicação e configuração inicial dos pinos high = off
   Serial.setTimeout(5);
+  pinMode(RELE_IRRIGACAO, OUTPUT);
   pinMode(LED_BUILTIN_PIN, OUTPUT);
   pinMode(BTN_RESET, INPUT_PULLUP);
   pinMode(RELE_AQUECIMENTO, OUTPUT);
@@ -1319,12 +1449,14 @@ void setup() {
   digitalWrite(LUZ_VERMELHA, HIGH);
   digitalWrite(LUZ_BRANCA2, HIGH);
   digitalWrite(LUZ_VIOLETA, HIGH);
-  delay(5000); // Pausa para conectar monitor serial cabeado
-  logMessage("[GREENHOUSE] Sistema iniciando...");
+  digitalWrite(RELE_IRRIGACAO, HIGH);
+  delay(4000); // Pausa para conectar monitor serial cabeado
   inicializarSD();
-  delay(500);
+  delay(1000);
+  logMessage("[GREENHOUSE] Sistema iniciando...");
+  delay(1000);
   logMessage("[SISTEMA] Cultivo de " + modoIluminacao + " configurado.");
-  // ---- AUTO-DETECÇÃO DE SENSOR (DHT11 ou SCD30) ----
+   // ---- AUTO-DETECÇÃO DE SENSORES (Sensor de solo, DHT11 ou SCD30) ----
   dht.begin();
   float testT = dht.readTemperature();
   float testU = dht.readHumidity();
@@ -1341,7 +1473,11 @@ void setup() {
       logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] ERRO: Falha de leitura no sensor de ambiente!");
     }
   }
-  // Configura conexão baseada na memória
+  if (analogRead(SENSOR_SOLO_PIN) == 0) {
+      logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor de umidadedo solo não detectado!");} else{
+      logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor de umidadedo solo detectado e em uso.");
+      soloDisponivel = true;}
+   // Configura conexão baseada na memória
   carregarConfiguracoesRede();
   prefs.begin("greenhouse", true);
   String savedPerfil = prefs.getString("perfil_ativo", "Frutificação");
@@ -1388,6 +1524,10 @@ void setup() {
   server.on("/setco2Margem", handleSetco2Margem);
   server.on("/setUmidMin", handleSetUmidMin);
   server.on("/setUmidIdeal", handleSetUmidIdeal);
+  server.on("/calibrarSeco", handleCalibrarSeco);
+  server.on("/calibrarUmido", handleCalibrarUmido);
+  server.on("/setUmidSoloAlvo", handleSetUmidSoloAlvo);
+  server.on("/setUmidSoloMargem", handleSetUmidSoloMargem);
   server.on("/restaurarPerfil", handleRestaurarPerfil);
   server.on("/setHora", handleSetHora);
   server.on("/set_wifi_mode", HTTP_POST, handleSetWifiMode);
@@ -1488,7 +1628,7 @@ void loop() {
       processarIluminacao();
     }
   }
-  // --- LEITURA DO SENSOR (DHT11 ou SCD30 com captura de CO2) ---
+  // --- LEITURA DO SENSOR DE AR (DHT11 ou SCD30 com captura de CO2) ---
   // O ciclo é de 3 segundos (3000ms) para acompanhar a carga de leitura do SCD30
 	if (tempoAtual - tempoSensor >= 3000) {
     tempoSensor = tempoAtual;
@@ -1516,11 +1656,25 @@ void loop() {
       if (tempoAtual - tempoLogSensor >= 60000 || tempoLogSensor == 0) {
         tempoLogSensor = tempoAtual;
     if ((umidadeAtual == 0) && (temperaturaAtual == 0)) {logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Leitura indisponível! Aguardando próximo ciclo...");}
-    if ((umidadeAtual != 0) && (temperaturaAtual != 0)) {
+    if ((umidadeAtual != 0) && (temperaturaAtual != 0) && (umidadeSoloPerc <= 0)) {
+      if (umidadeSoloPerc < 0) {
         if (usaSCD30) {
-          logMessage("[" + getHoraSimuladaString() + "] T:" + String(temperaturaAtual, 1) + "ºC | U:" + String(umidadeAtual, 0) + "% | CO2:" + String(co2Atual, 0) + "ppm");
+          logMessage("[" + getHoraSimuladaString() + "] T:" + String(temperaturaAtual, 1) + "ºC | UA:" + String(umidadeAtual, 0) + "% | CO2:" + String(co2Atual, 0) + "ppm | US: [ERRO]" + String(umidadeSoloPerc, 0) + "%");
+          if (automacaoAtiva) { digitalWrite(RELE_IRRIGACAO, HIGH);}  // Desliga relé
         } else {
-          logMessage("[" + getHoraSimuladaString() + "] T:" + String(temperaturaAtual, 1) + "ºC | U:" + String(umidadeAtual, 0) + "%");
+          logMessage("[" + getHoraSimuladaString() + "] T:" + String(temperaturaAtual, 1) + "ºC | UA:" + String(umidadeAtual, 0) + "% | US: [ERRO]" + String(umidadeSoloPerc, 0) + "%");
+          if (automacaoAtiva) { digitalWrite(RELE_IRRIGACAO, HIGH);}  // Desliga relé
+        }} else {
+        if (usaSCD30) {
+          logMessage("[" + getHoraSimuladaString() + "] T:" + String(temperaturaAtual, 1) + "ºC | UA:" + String(umidadeAtual, 0) + "% | CO2:" + String(co2Atual, 0) + "ppm");
+        } else {
+          logMessage("[" + getHoraSimuladaString() + "] T:" + String(temperaturaAtual, 1) + "ºC | UA:" + String(umidadeAtual, 0) + "%");
+        }}}
+            if ((umidadeAtual != 0) && (temperaturaAtual != 0) && (umidadeSoloPerc > 0)) {
+        if (usaSCD30) {
+          logMessage("[" + getHoraSimuladaString() + "] T:" + String(temperaturaAtual, 1) + "ºC | UA:" + String(umidadeAtual, 0) + "% | CO2:" + String(co2Atual, 0) + "ppm | US:" + String(umidadeSoloPerc, 0) + "%");
+        } else {
+          logMessage("[" + getHoraSimuladaString() + "] T:" + String(temperaturaAtual, 1) + "ºC | UA:" + String(umidadeAtual, 0) + "% | US:" + String(umidadeSoloPerc, 0) + "%");
         }}
       }
     } else {
@@ -1528,7 +1682,7 @@ void loop() {
       if (tempoAtual - tempoLogSensor >= 10000 || tempoLogSensor == 0) {
           tempoLogSensor = tempoAtual;
          if (automacaoAtiva) {
-         logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor indisponível! Atuadores de ambiente interrompidos...");
+         logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor de Ar indisponível! Atuadores de ambiente interrompidos...");
          digitalWrite(RELE_REFRIGERACAO, HIGH);
          digitalWrite(RELE_INJECAO_CO2, HIGH);
          digitalWrite(RELE_AQUECIMENTO, HIGH);
@@ -1537,10 +1691,28 @@ void loop() {
          digitalWrite(RELE_UMIDADE_2, HIGH); 
          etapaUmidade = 0;
         } else {
-         logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor indisponível! Aguardando nova leitura...");
+         logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor de Ar indisponível! Aguardando nova leitura...");
         }
       }
     }
+  }
+  // LEITURA DO SENSOR DE SOLO: Contador de coleta da amostra do sensor de solo a cada 500 ms para formar a média
+  if (tempoAtual - tempoAmostraSolo >= 250) {
+   tempoAmostraSolo = tempoAtual;
+   acumuladorSolo += analogRead(SENSOR_SOLO_PIN);
+   amostrasSoloCount++;
+  }
+  if (amostrasSoloCount == 12) {    // Processa a média das amostras do sensor de solo coletadas nos últimos segundos
+    if (analogRead(SENSOR_SOLO_PIN) != 0) {
+        int mediaBruta = acumuladorSolo / amostrasSoloCount;
+        if (usMax != usMin) {       // Fórmula de conversão percentual (permite ultrapassar 100% ou ficar negativa)
+          umidadeSoloPerc = ((float)(mediaBruta - usMin) / (float)(usMax - usMin)) * 100.0;
+        } else {
+          umidadeSoloPerc = 0.0;
+        }
+        acumuladorSolo = 0;      // Reseta o acumulador para o próximo ciclo
+        amostrasSoloCount = 0;
+    } else {umidadeSoloPerc = 0; }
   }
 // Pisca LED automação ativa
   if (automacaoAtiva) { // executa tudo quando automação == ativa
@@ -1551,7 +1723,7 @@ void loop() {
  	   if (!tentandoConectarWifi) {
  	     digitalWrite(LED_BUILTIN_PIN, estadoLed);
  	   }
-    // Segurança dos atuadores em caso de falha (não atuam)
+    // Segurança dos atuadores de Ar em caso de falha (não atuam)
     if (leituraSucesso) {
     // Lógica de Temperatura
       if (temperaturaAtual != 0) { 
@@ -1611,6 +1783,41 @@ void loop() {
         }
       }
     }
+    // --- Lógica de Irrigação do Solo (pela umidade do solo) ---
+    if (soloDisponivel) { // Garante que há leitura válida
+      if (automacaoAtiva) { 
+        // Se a umidade cair abaixo do alvo menos a margem, liga a irrigação
+        if (umidadeSoloPerc < (usAlvo - usMargem) && digitalRead(RELE_IRRIGACAO) == HIGH && umidadeSoloPerc > 0) {
+          digitalWrite(RELE_IRRIGACAO, LOW); // Liga relé
+          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Umidade do solo baixa (" + String(umidadeSoloPerc, 1) + "%). Irrigação LIGADA!");
+          } 
+        // Se a umidade atingir o alvo, desliga a irrigação
+        else if ((umidadeSoloPerc >= usAlvo) && digitalRead(RELE_IRRIGACAO) == LOW) {
+          digitalWrite(RELE_IRRIGACAO, HIGH); // Desliga relé
+          logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Umidade do solo ideal alcançada. Irrigação DESLIGADA.");
+        }
+      }
+    }
+     if (analogRead(SENSOR_SOLO_PIN) == 0 && soloDisponivel) { // Mensagens de detecção do sensor de solo
+          if (digitalRead(RELE_IRRIGACAO) == LOW) {
+       soloDisponivel = false;
+       digitalWrite(RELE_IRRIGACAO, HIGH); // Desliga relé
+       logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Conexão perdida com Sensor de umidade do solo! Irrigação interrompida!");
+        } else {
+       soloDisponivel = false;
+       logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Conexão perdida com Sensor de umidade do solo!");
+        }
+     }
+     if (analogRead(SENSOR_SOLO_PIN) != 0 && !soloDisponivel) {
+      if (umidadeSoloPerc > 0) {
+     soloDisponivel = true;
+     digitalWrite(RELE_IRRIGACAO, HIGH); // Desliga relé
+     logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor de umidade do solo detectado com leitura Irregular!");
+
+      } else {
+     soloDisponivel = true;
+     logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor de umidade do solo Detectado!");
+     }}
   }
     // Sequência de acionamento do umidificador e gatilho
     if (precisaUmidificar) {
