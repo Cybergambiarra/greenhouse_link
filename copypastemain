@@ -11,7 +11,7 @@
 #include <SparkFun_SCD30_Arduino_Library.h>
 // Configurações de NTP
 const char* ntpServer = "a.st1.ntp.br"; 
-const long gmtOffset_sec = -10800;       
+long gmtOffset_sec = -10800; // Padrão inicial UTC-3 em segundos
 const int daylightOffset_sec = 0;
 unsigned long tempoUltimoNTP = 0;
 const unsigned long INTERVALO_NTP = 86400000; 
@@ -96,6 +96,7 @@ bool estadoLed = false;
 float temperaturaAtual = 0;
 float umidadeAtual = 0;
 float co2Atual = 0;          // Leitura de CO2 do SCD30
+int diasRetencao = 90; // Valor padrão inicial de idade do log para deleção automática (dias)
 // Variáveis do atuador de comparação da leitura
 bool precisaUmidificar = false;
 int etapaUmidade = 0; 
@@ -240,7 +241,7 @@ void verificarReconexaoSD() {
   }
 }
 // Remove logs com mais de X dias de idade para manter o SD interface web prática
-void limparLogsAntigos(int diasRetencao = 90) {
+void limparLogsAntigos() {
   if (!sdDisponivel || !ntpSincronizado) return;
   time_t now;
   time(&now);
@@ -384,6 +385,9 @@ void carregarPerfil(String perfil) {
   modoIluminacao = prefs.getString("modo_ilu", "Cogumelos");
   duracaoDia = prefs.getFloat("dur_dia", 12.0);
   co2Margem = prefs.getFloat("margem_co2", 500.0);
+  gmtOffset_sec = prefs.getLong("gmt_offset", -10800);
+  diasRetencao = prefs.getInt("dias_ret", 90);
+  modoWifi = prefs.getInt("wifi_mode", 0);
   prefs.end();
   perfilAtivo = perfil;
 }
@@ -437,13 +441,13 @@ void restaurarFabricaPerfilAtivo() {
     prefs.putFloat("inc_t", 22.0); 
     prefs.putFloat("inc_u", 65.0); 
     prefs.putBool("inc_c", false);
-    prefs.putFloat("inc_co", 1000.0); // Chave corrigida
+    prefs.putFloat("inc_co", 1000.0); 
     tempAlvo = 22.0; umidMinima = 65.0; cicloAuto = false; co2Alvo = 1000;
   } else if (perfilAtivo == "Frutificação") {
     prefs.putFloat("frut_t", 18.0); 
     prefs.putFloat("frut_u", 90.0); 
     prefs.putBool("frut_c", true);
-    prefs.putFloat("frut_co", 1500.0); // Chave corrigida
+    prefs.putFloat("frut_co", 1500.0); 
     tempAlvo = 18.0; umidMinima = 90.0; cicloAuto = true; co2Alvo = 1500;
   } else if (perfilAtivo == "Personalizado") {
     prefs.putFloat("pers_t", 20.0); 
@@ -457,11 +461,13 @@ void restaurarFabricaPerfilAtivo() {
   modoIluminacao = "Cogumelos";
   duracaoDia = 12.0;
   co2Margem = 500;
+  gmtOffset_sec = -10800;
   prefs.putFloat("umid_ideal", umidIdeal);
   prefs.putFloat("temp_margem", tempMargem);
   prefs.putString("modo_ilu", modoIluminacao);
   prefs.putFloat("dur_dia", duracaoDia);
   prefs.putFloat("margem_co2", co2Margem);
+  prefs.putLong("gmt_offset", gmtOffset_sec);
   prefs.end();
 }
 void handleSetPerfil() {
@@ -743,17 +749,38 @@ void sincronizarNTP() {
     }
   }
 }
+void handleSetFusoHorario() { // Aplicação de fusohorário
+  if (configuracoesDesbloqueadas && server.hasArg("fuso")) {
+    int horas = server.arg("fuso").toInt();
+    // Validação de limites globais de fuso horário (-12h até +14h)
+    if (horas >= -12 && horas <= 14) {
+      gmtOffset_sec = (long)horas * 3600; // Converte horas em segundos
+      prefs.begin("greenhouse", false);
+      prefs.putLong("gmt_offset", gmtOffset_sec);
+      prefs.end();
+      logMessage("[CONFIG] Fuso horário alterado para UTC " + String(horas) + "h (" + String(gmtOffset_sec) + "s)" + getClientDetails());
+      // Opcional: Tenta sincronizar imediatamente com o NTP usando o novo fuso
+      sincronizarNTP();
+      server.send(200, "text/plain", "OK");
+    } else {
+      server.send(400, "text/plain", "Valor invalido");
+    }
+  } else {
+    server.send(403, "text/plain", "Acesso Negado");
+  }
+}
 // Ajuste do modo wifi (AP ou STA)
 void handleSetWifiMode() {
-  if (server.hasArg("mode")) {
+  if (configuracoesDesbloqueadas && server.hasArg("mode")) {
     modoWifi = server.arg("mode").toInt();
     prefs.begin("greenhouse", false);
-    prefs.putInt("modo_wifi", modoWifi);
+    prefs.putInt("wifi_mode", modoWifi);
     prefs.end();
-    logMessage("[REDE] Modo alterado para " + String(modoWifi == 0 ? "Apenas AP" : "Cliente STA + AP Automático") + ". Reinicie o ESP32." + getClientDetails());
+    logMessage("[CONFIG] Modo Wi-Fi alterado para: " + String(modoWifi == 0 ? "AP" : "STA+AP") + getClientDetails());
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(403, "text/plain", "Acesso Negado");
   }
-  server.sendHeader("Location", "/");
-  server.send(303);
 }
 // Aplica nome de rede AP e senha
 void handleSetApCreds() {
@@ -780,7 +807,6 @@ void handleSetStaCreds() {
   if (server.hasArg("ssid") && server.hasArg("pass")) {
     ssidSTA = server.arg("ssid");
     passSTA = server.arg("pass");
-    modoWifi = 1;
     prefs.begin("greenhouse", false);
     prefs.putString("ssid_sta", ssidSTA);
     prefs.putString("pass_sta", passSTA);
@@ -899,6 +925,24 @@ void handleArquivoEspecifico() {
     server.send(400, "text/plain", "Parametro ausente");
   }
 }
+void handleSetDiasRetencao() {
+  if (configuracoesDesbloqueadas && server.hasArg("dias")) {
+    int val = server.arg("dias").toInt();
+    if (val >= 3 && val <= 999) {
+      diasRetencao = val;
+      prefs.begin("greenhouse", false);
+      prefs.putInt("dias_ret", diasRetencao);
+      prefs.end();
+      logMessage("[CONFIG] Dias de retenção de logs alterado para " + String(diasRetencao) + getClientDetails());
+      server.send(200, "text/plain", "OK");
+    } else {
+      logMessage("[CONFIG] [ERRO] Valor de retenção de logs inválido." + getClientDetails());
+      server.send(400, "text/plain", "Valor invalido");
+    }
+  } else {
+    server.send(403, "text/plain", "Acesso Negado");
+  }
+}
 // Atualizador de status e campos variáveis na interface web
 void handleStatus() {
   String logEscaped = getLogEscapedJSON();
@@ -922,6 +966,7 @@ void handleStatus() {
   json += "\"durDia\":\"" + String(duracaoDia, 1) + "\",";
   json += "\"cAuto\":" + String(cicloAuto ? "true" : "false") + ",";
   json += "\"auto\":" + String(automacaoAtiva ? "true" : "false") + ",";
+  json += "\"wifiMode\":" + String(modoWifi) + ",";
   json += "\"unlocked\":" + String(configuracoesDesbloqueadas ? "true" : "false") + ",";
   json += "\"aq\":" + String(digitalRead(RELE_AQUECIMENTO) == LOW ? "true" : "false") + ",";
   json += "\"ref\":" + String(digitalRead(RELE_REFRIGERACAO) == LOW ? "true" : "false") + ",";
@@ -946,7 +991,7 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
 <head>
    <meta charset='UTF-8'>
    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
-   <title>Greenhouse Link v2.36C</title>
+   <title>Greenhouse Link v2.38B</title>
    <style>
    body { font-family: Arial, sans-serif; background-color: #f0f2f5; margin: 20px; display: flex; flex-direction: column; gap: 20px; }
    .box { background: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
@@ -1004,9 +1049,9 @@ const char WEB_PAGE[] PROGMEM = R"rawliteral(
    <button id='btnLB2' class='pin-btn off' onclick='cliquePino(12)'>Luz Branca 2<br><small id='txtLB2'>INATIVO</small></button>
    <button id='btnLVerm' class='pin-btn off' onclick='cliquePino(26)'>Luz Vermelha<br><small id='txtLVerm'>INATIVO</small></button>
    <button id='btnLViol' class='pin-btn off' onclick='cliquePino(13)'>Luz Violeta<br><small id='txtLViol'>INATIVO</small></button>
-   <button id='btnLed' class='pin-btn off' onclick='cliquePino(2)'>Indicador LED<br><small id='txtLed'>INATIVO</small></button>
    <button id='btnIrrig' class='pin-btn off' onclick='cliquePino(15)'>Irrigação<br><small id='txtIrrigacao'>INATIVO</small></button>
-  <!-- DEUS SEJA LOUVADO! - código criado por jimmy spada magave usando gemini basico-->
+   <button id='btnLed' class='pin-btn off' onclick='cliquePino(2)'>Indicador LED<br><small id='txtLed'>INATIVO</small></button>
+     <!-- DEUS SEJA LOUVADO! - código criado por jimmy spada magave usando gemini basico-->
    </div></div><div class='box'>
   <h2>2. Monitor</h2>
   <div class='dos-prompt' id='dosConsole'></div>
@@ -1120,6 +1165,11 @@ function apagarArquivoSD(nomeArquivo) {
    <button id='btnApplyHora' class='btn-action' style='background:#007bff;' onclick='aplicarHora()'>Aplicar Hora</button>
    </div>
    <div class='input-group'>
+   <label for='inFuso'>Fuso Horário (Offset UTC em horas):</label>
+   <input type='number' id='inFuso' step='1' min='-12' max='14' placeholder='Ex: -3'> 
+   <button id='btnApplyFuso' class='btn-action' style='background:#007bff;' onclick='aplicarFusoHorario()'>Aplicar Fuso</button>
+   </div>
+   <div class='input-group'>
    <label>Ciclo dia e noite simulada:</label>
    <button id='btnToggleCiclo' class='btn-action' style='background:#007bff; margin:0;' onclick='toggleCicloAuto()'>--</button>
    </div>
@@ -1178,6 +1228,11 @@ function apagarArquivoSD(nomeArquivo) {
    <input type='number' id='inUsMargem' step='1.0' min='1' max='50' placeholder='Ex: 10'> 
    <button id='btnApplyUsMargem' class='btn-action' style='background:#007bff;' onclick='aplicarUsMargem()'>Aplicar</button>
    </div>
+   <div class='input-group'>
+   <label for='inDiasRet'>Retenção de Logs (dias):</label>
+   <input type='number' id='inDiasRet' step='1' min='3' max='999' placeholder='Ex: 30'> 
+   <button id='btnApplyDiasRet' class='btn-action' style='background:#007bff;' onclick='aplicarDiasRetencao()'>Aplicar Retenção</button>
+   </div>
    <div class='input-group' style='margin-top:15px;'>
    <label for='inNovaSenha'>Trocar senha de acesso:</label>
    <input type='password' id='inNovaSenha' placeholder='********'> 
@@ -1190,6 +1245,11 @@ function apagarArquivoSD(nomeArquivo) {
    </div>
    <div class='box'>
    <h2>4. Conectividade</h2>
+   <div class='input-group'>
+   <label>Modo de Operação:</label>
+   <button id='btnWifiAP' class='btn-profile' onclick="setWifiMode(0)">Apenas AP</button>
+   <button id='btnWifiSTA' class='btn-profile' onclick="setWifiMode(1)">Cliente STA + AP</button>
+   </div>
    <p><small style='color:#666;'>Nota: Para alterar o modo Wi-Fi ou credenciais, use os formulários abaixo e depois clique em Reiniciar ESP32.</small></p>
    <div class='sub-box'>
    <h4>Configuração AP (ponto de acesso wireless)</h4>
@@ -1295,6 +1355,14 @@ function apagarArquivoSD(nomeArquivo) {
        document.getElementById('inStaPass').disabled = lock;
        document.getElementById('btnSaveSta').disabled = lock;
        document.getElementById('btnRestart').disabled = lock;
+       document.getElementById('inDiasRet').disabled = lock;
+       document.getElementById('btnApplyDiasRet').disabled = lock;
+       document.getElementById('inFuso').disabled = lock;
+       document.getElementById('btnApplyFuso').disabled = lock;
+       document.getElementById('btnWifiAP').className = 'btn-profile' + (d.wifiMode === 0 ? ' active' : '');
+       document.getElementById('btnWifiSTA').className = 'btn-profile' + (d.wifiMode === 1 ? ' active' : '');
+       document.getElementById('btnWifiAP').disabled = lock;
+       document.getElementById('btnWifiSTA').disabled = lock;
        function renderBtn(idBtn, idTxt, ativo, unlocked) {
          let b = document.getElementById(idBtn);
          let t = document.getElementById(idTxt);
@@ -1331,6 +1399,34 @@ function desbloquearConfig() {
       });
   }
 }
+  function aplicarDiasRetencao() {
+    let d = document.getElementById('inDiasRet').value;
+    if(d !== '') {
+      fetch('/setDiasRetencao?dias=' + d, { method: 'POST' })
+        .then(r => {
+          if(r.ok) {
+            document.getElementById('inDiasRet').value = '';
+            atualizarStatus();
+          } else {
+            alert('Erro ao definir dias de retenção.');
+          }
+        });
+    }
+  }
+  function aplicarFusoHorario() {
+    let f = document.getElementById('inFuso').value;
+    if(f !== '') {
+      fetch('/setFusoHorario?fuso=' + f, { method: 'POST' })
+        .then(r => {
+          if(r.ok) {
+             document.getElementById('inFuso').value = '';
+             atualizarStatus();
+           } else {
+             alert('Erro ao definir fuso horário.');
+           }
+         });
+    }
+  }
    function bloquearConfig() { fetch('/bloquear').then(() => atualizarStatus()); }
    function cliquePino(p) { fetch('/togglePino?pin=' + p).then(() => atualizarStatus()); }
    function setPerfil(p) { fetch('/setPerfil?p=' + p).then(() => atualizarStatus()); }
@@ -1369,6 +1465,16 @@ function desbloquearConfig() {
     });
   }
 }
+function setWifiMode(m) {
+     fetch('/setWifiMode?mode=' + m, { method: 'POST' }).then(r => {
+       if(r.ok) {
+         alert('Modo Wi-Fi alterado! Reinicie o ESP32 para aplicar.');
+         atualizarStatus();
+       } else {
+         alert('Erro ao alterar modo Wi-Fi (Verifique o desbloqueio do painel).');
+       }
+     });
+   }
 function aplicarUsAlvo() {
   let v = document.getElementById('inUsAlvo').value;
   if(v !== '') fetch('/setUmidSoloAlvo?usa=' + v, { method: 'POST' }).then(() => { document.getElementById('inUsAlvo').value = ''; atualizarStatus(); });
@@ -1474,8 +1580,8 @@ void setup() {
     }
   }
   if (analogRead(SENSOR_SOLO_PIN) == 0) {
-      logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor de umidadedo solo não detectado!");} else{
-      logMessage("[" + getHoraSimuladaString() + "] [SISTEMA] Sensor de umidadedo solo detectado e em uso.");
+      logMessage("[SISTEMA] Sensor de umidadedo solo não detectado!");} else{
+      logMessage("[SISTEMA] Sensor de umidadedo solo detectado e em uso.");
       soloDisponivel = true;}
    // Configura conexão baseada na memória
   carregarConfiguracoesRede();
@@ -1530,7 +1636,9 @@ void setup() {
   server.on("/setUmidSoloMargem", handleSetUmidSoloMargem);
   server.on("/restaurarPerfil", handleRestaurarPerfil);
   server.on("/setHora", handleSetHora);
-  server.on("/set_wifi_mode", HTTP_POST, handleSetWifiMode);
+  server.on("/setDiasRetencao", handleSetDiasRetencao);
+  server.on("/setFusoHorario", HTTP_POST, handleSetFusoHorario);
+  server.on("/setWifiMode", HTTP_POST, handleSetWifiMode);
   server.on("/set_ap_creds", HTTP_POST, handleSetApCreds);
   server.on("/set_sta_creds", HTTP_POST, handleSetStaCreds);
   server.on("/restart", handleRestart);
@@ -1849,5 +1957,5 @@ void loop() {
         etapaUmidade = 0;
         } 
       }
-}
+  }
 }
