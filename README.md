@@ -66,7 +66,7 @@ Embora o foco inicial tenha sido a **produção de cogumelos** (que exigem contr
 <a id="english"></a>
 ## 🇬🇧 English
 
-**Greenhouse Link** **Conexão Estufa** is an automation and monitoring system for micro-environments, based on the **ESP32** microcontroller. It is designed to precisely control the climate within greenhouses, grow tents, or controlled environments of **up to 40 m²** per unit (expandable depending on the surrounding infrastructure).
+**Greenhouse Link** is an automation and monitoring system for micro-environments, based on the **ESP32** microcontroller. It is designed to precisely control the climate within greenhouses, grow tents, or controlled environments of **up to 40 m²** per unit (expandable depending on the surrounding infrastructure).
 
 Developed with a focus on robustness, low cost, and ease of assembly, it serves a wide range of users, including small-scale agricultural producers, hobbyists, researchers, and enthusiasts.
 
