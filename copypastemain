@@ -1080,18 +1080,19 @@ var painelBloqueado = true; // Controla a exibição dos botões javascript na t
 function carregarHistoricoSD() {
   const container = document.getElementById('historicoContainer');
   const tbody = document.getElementById('listaLogsBody');
-  // Alterna a exibição
-  if (container.style.display === 'block') {
+    if (container.style.display === 'block') {
     container.style.display = 'none';
     return;
   }
-  fetch('/api/logs')
+    fetch('/api/logs')
     .then(response => response.json())
     .then(data => {
       tbody.innerHTML = '';
       if (data.length === 0) {
         tbody.innerHTML = '<tr><td colspan="3">Histórico vazio ou cartão SD ausente.</td></tr>';
       } else {
+        // Ordena os arquivos (ex: ordem decrescente pelo nome para mostrar os mais recentes primeiro)
+        data.sort((a, b) => b.nome.localeCompare(a.nome));
         data.forEach(item => {
           const kb = (item.tamanho / 1024).toFixed(1);
           const tr = document.createElement('tr');
@@ -1306,7 +1307,7 @@ function apagarArquivoSD(nomeArquivo) {
        painelBloqueado = lock;
        if(!d.unlocked) {
          autoBox.innerHTML = "<p>Estado Atual: <strong style='color:#28a745;'>AUTOMAÇÃO ATIVA</strong></p><button class='btn-control btn-pause' onclick='desbloquearConfig()'>Desbloquear configurações</button>";
-         aviso.innerText = '* Insira a senha para habilitar o painel de alteração de parâmetros e controle manual.';
+         aviso.innerText = '* Desbloqueie as configurações para habilitar o painel de alteração de parâmetros e controle manual.';
          } else {
          autoBox.innerHTML = "<p>Estado Atual: <strong style='color:#dc3545;'>AUTOMAÇÃO INTERROMPIDA</strong></p><button class='btn-control btn-resume' onclick='bloquearConfig()'>Bloquear configurações</button>";
          aviso.innerText = '';
