@@ -36,7 +36,6 @@ Embora o foco inicial tenha sido a **produção de cogumelos** (que exigem contr
 | Pino do ESP32 | Função no Sistema | Descrição do Componente |
 | :--- | :--- | :--- |
 | **GPIO 02** | Saida Digital | Luz de Sistema Indicadora de Funcionamento (Pisca conforme Status) |
-| **GPIO 02** | Saida Digital | Luz de Sistema Indicadora de Funcionamento (Pisca conforme Status) |
 | **GPIO 34** | Entrada Analógica | Sensor de Umidade do Solo (Capacitivo/Resistivo) |
 | **GPIO 25** | Comunicação Digital | Entrada de sinal do Sensor DHT11 (Quando Aplicado) |
 | **GPIO 23** | Comunicação Digital | Conexão com Módulo Micro SD MOSI (Quando Aplicado) |
