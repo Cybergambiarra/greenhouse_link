@@ -1,0 +1,65 @@
+-- LISTA DE MATERIAIS -- BILL OF MATERIALS --
+# Lista de Materiais (LDM) - Conexão Estufa 🌿🍄
+
+Este documento relaciona todos os componentes físicos, módulos eletrônicos e itens de hardware necessários para a montagem da unidade de controle e das unidades de sensores remotos do Greenhouse Link. ---
+
+## 1. Módulos, Eletrônica e Controle
+* **1x** ESP32 DevKit V1 (30 pinos ou mais)
+* **1x** Conjunto de módulos de relé (totalizando **12 canais** de relés de 3,3V/5V; inclui um módulo de relé dedicado ao circuito de controle do sensor de umidade do solo)
+* **1x** Fonte de alimentação de 5V / 2A (ou conversor DC-DC de tensão — *step-down/up* *buck converter* — para alimentar com outros sistemas)
+
+## 2. Sensores Remotos e Condicionamento de Sinal
+* **1x** Sensor de umidade do solo – opcional (recomenda-se o modelo capacitivo v1.2 ou superior; requer o módulo de relé dedicado mencionado anteriormente)
+* **1x** Sensor de temperatura e umidade do ar / sensor de gases (SCD30 para CO₂ ou DHT11/DHT22 para uma configuração básica)
+* **2x** Resistores (4,7 kΩ / 4k7)
+* **1x** Capacitor eletrolítico (100 µF)
+
+## 3. Conectividade e Cabeamento (Padrão RJ45)
+* **Cabos:** Cabo Ethernet UTP Cat5e ou Cat6 (recomenda-se o uso de cores vivas para facilitar a identificação em ambientes de estufa)
+* **Conectores de painel:** **2x** Conectores RJ45 fêmea para montagem em painel
+* **Cabeamento interno:** Cabos *jumper* tipo Dupont (macho/fêmea) e placa perfurada ou protoboard
+
+## 4. Gabinetes, Fixação e Ferragens
+* **Gabinetes:**
+* **1x** Caixa grande de derivação principal em ABS, à prova d'água (para o ESP32, relés e fonte de alimentação - aprox. 20x20cm)
+* **1x** Caixa pequena de derivação remota em ABS (para os sensores de solo e de ar - padrão tomada)
+* **Elementos de fixação:**
+* **Kit de parafusos M2:** parafusos M2, espaçadores M2x10mm e porcas para a fixação segura dos módulos dentro dos gabinetes
+* **Acabamento e organização:**
+* **Braçadeiras de nylon (*zip ties*):** para alívio de tensão nos cabos RJ45
+* **Tubo termorretrátil:** para isolamento de conexões soldadas
+
+------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------
+
+# Bill of Materials (BOM) - Greenhouse Link 🌿🍄
+
+This document lists all physical components, electronic modules, and hardware required to build the Greenhouse Link control box and remote sensor units.
+
+---
+
+## 1. Modules, Electronics & Control
+* **1x** ESP32 DevKit V1 (30 pins or more)
+* **1x** Relay Module Setup (Totaling **12 channels** of 3V3/5V relay modules, including a separate standalone relay module dedicated to the soil moisture sensor control circuit)
+* **1x** Power Supply 5V / >2A (or DC-DC Buck Converter for other setups)
+
+## 2. Remote Sensors & Signal Conditioning
+* **1x** Soil Moisture Sensor - optional (Capacitive v1.2 or better recommended, need the standalone relay module here)
+* **1x** Air Temperature & Humidity / Gas Sensor (SCD30 for CO₂ or DHT11/DHT22 for basic setup)
+* **2x** Resistors (4.7 k$\Omega$ / 4k7)
+* **1x** Electrolytic Capacitor (100 µF)
+
+## 3. Connectivity & Cabling (RJ45 Standard)
+* **Cables:** UTP Cat5e or Cat6 Ethernet Cable (recommended bright color for greenhouse identification)
+* **Panel Connectors:** **2x** RJ45 Female Panel Mount Connectors
+* **Internal Wiring:** Dupont jumper wires (male/female) and perfboard/protoboard
+
+## 4. Enclosures, Fastening & Hardware
+* **Enclosures:**
+  * **1x** Main big ABS Waterproof Junction Box (for ESP32, relays, and power supply - around 20x20cm)
+  * **1x** Remote small ABS Junction Box (for soil and air sensors - outlet standard size)
+* **Fasteners:**
+  * **M2 Screw Kit:** M2 screws, M2x10mm standoffs (spacers), and nuts for secure module mounting inside the enclosures
+* **Finishing & Organization:**
+  * **Cable ties (Zip ties):** For strain relief on RJ45 cables
+  * **Heat shrink tubing:** For soldered connection insulation
