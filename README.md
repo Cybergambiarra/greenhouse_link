@@ -21,7 +21,7 @@ Embora o foco inicial tenha sido a **produção de cogumelos** (que exigem contr
 ---
 
 ### ✨ Principais Recursos
-* **Controle Histerético Avançado:** Evita o acionamento constante e o desgaste mecânico de relés em leituras flutuantes.
+* **Controle Histerético:** Evita o acionamento constante e o desgaste mecânico de relés em leituras flutuantes.
 * **Iluminação Progressiva de 4 Canais:** Simulação de ciclos de luz do sol para diferentes fases de desenvolvimento (vegetativo, floração ou frutificação).
 * **Injeção de CO₂:** Parâmetros configuráveis para otimizar a fotossíntese em plantas.
 * **Controle de Irrigação do Solo:** Leitura analógica com calibração e segurança contra falhas de sensor.
@@ -80,7 +80,7 @@ While initially developed for **mushroom cultivation**—which requires strict c
 ---
 
 ### ✨ Key Features
-* **Advanced Hysteresis Control:** Prevents frequent switching and mechanical wear on relays caused by fluctuating sensor readings.
+* **Hysteresis Control:** Prevents frequent switching and mechanical wear on relays caused by fluctuating sensor readings.
 * **4-Channel Progressive Lighting:** Simulates natural sunlight cycles tailored to different developmental stages (vegetative, flowering, or fruiting).
 * **CO₂ Injection:** Configurable parameters to optimize photosynthesis in plants.
 * **Soil Irrigation Control:** Analog sensing with calibration and built-in fail-safes for sensor errors. * **Persistent Storage (NVS):** All settings (calibration, setpoints, time zone, Wi-Fi mode, and log retention period) are saved to the ESP32’s internal memory and automatically restored after reboots.
