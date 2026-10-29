@@ -29,7 +29,7 @@ Este documento relaciona todos os componentes físicos, módulos eletrônicos e 
 * **Braçadeiras de nylon (*zip ties*):** para alívio de tensão nos cabos RJ45
 * **Tubo termorretrátil:** para isolamento de conexões soldadas
 
-📁 Acesse a pasta completa com os diagramas elétricos em: [Wiring_Diagramas/](Wiring_Diagramas/)
+<a href="./Wiring_Diagramas/">📁 Acesse a pasta completa com os diagramas elétricos</a>
 ------------------------------------------------------------------------------------------------------------------------
 ------------------------------------------------------------------------------------------------------------------------
 
@@ -65,4 +65,4 @@ This document lists all physical components, electronic modules, and hardware re
   * **Cable ties (Zip ties):** For strain relief on RJ45 cables
   * **Heat shrink tubing:** For soldered connection insulation
 
-📁 Access the complete folder containing the electrical diagrams at: [Wiring Diagrams/](Wiring_Diagramas/)
+<a href="./Wiring_Diagramas/">📁 Access the complete folder containing the electrical diagrams</a>
