@@ -9,7 +9,7 @@
 
 O **Conexão Estufa** é um sistema de automação e monitoramento de microambientes baseado em **ESP32**, projetado para controlar com precisão o clima de estufas, tendas de cultivo ou ambientes controlados de **até 40 m²** para uma única unidade (expansível conforme a infraestrutura em volta). 
 
-Desenvolvido com foco na robustez, baixo custo e facilidade de montagem, ele atende tanto pequenos produtores agrícolas quanto hobbistas, pesquisadores e entusiastas.
+Desenvolvido com foco na robustez, baixo custo incrível modularidade e facilidade de montagem, ele atende tanto pequenos produtores agrícolas quanto hobbistas, pesquisadores e entusiastas.
 
 ### 🎯 Aplicações e Versatilidade
 Embora o foco inicial tenha sido a **produção de cogumelos** (que exigem controle rigoroso de umidade e trocas de ar), o ecossistema é altamente adaptável para:
@@ -21,6 +21,7 @@ Embora o foco inicial tenha sido a **produção de cogumelos** (que exigem contr
 ---
 
 ### ✨ Principais Recursos
+* **Compatibilidade de sensores:** Detecta automaticamente e utiliza sensores DHT11 ou SCD30; o sensor de umidade do solo é opcional e também é detectado automaticamente.
 * **Controle Histerético:** Evita o acionamento constante e o desgaste mecânico de relés em leituras flutuantes.
 * **Iluminação Progressiva de 4 Canais:** Simulação de ciclos de luz do sol para diferentes fases de desenvolvimento (vegetativo, floração ou frutificação).
 * **Injeção de CO₂:** Parâmetros configuráveis para otimizar a fotossíntese em plantas.
@@ -68,7 +69,7 @@ Embora o foco inicial tenha sido a **produção de cogumelos** (que exigem contr
 
 **Greenhouse Link** is an automation and monitoring system for micro-environments, based on the **ESP32** microcontroller. It is designed to precisely control the climate within greenhouses, grow tents, or controlled environments of **up to 40 m²** per unit (expandable depending on the surrounding infrastructure).
 
-Developed with a focus on robustness, low cost, and ease of assembly, it serves a wide range of users, including small-scale agricultural producers, hobbyists, researchers, and enthusiasts.
+Developed with a focus on robustness, low cost,incredible modularity, and ease of assembly, it serves a wide range of users, including small-scale agricultural producers, hobbyists, researchers, and enthusiasts.
 
 ### 🎯 Applications and Versatility
 While initially developed for **mushroom cultivation**—which requires strict control over humidity and air exchange—the ecosystem is highly adaptable for:
@@ -80,6 +81,7 @@ While initially developed for **mushroom cultivation**—which requires strict c
 ---
 
 ### ✨ Key Features
+* **Sensor Compatibility:** Auto-detects and use DHT11 or SCD30, Soil moisture sensor is optional and automatic detectable.
 * **Hysteresis Control:** Prevents frequent switching and mechanical wear on relays caused by fluctuating sensor readings.
 * **4-Channel Progressive Lighting:** Simulates natural sunlight cycles tailored to different developmental stages (vegetative, flowering, or fruiting).
 * **CO₂ Injection:** Configurable parameters to optimize photosynthesis in plants.
