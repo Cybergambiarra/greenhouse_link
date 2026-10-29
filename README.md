@@ -60,7 +60,7 @@ Embora o foco inicial tenha sido a **produção de cogumelos** (que exigem contr
 | **GND** | Resistor de 100k conectado ao **GPIO 34** | Sinal Sem Sensor (Sensor de solo) |
 | **GND / 3V3 / 5V**| Alimentação | Distribuição de energia para módulos e sensores |
 
-*[![Esquema Elétrico do Greenhouse Link](circuit_image.png)].*
+*![Esquema Elétrico do Greenhouse Link](Wiring_Diagramas/circuit_image.png).*
 
 ---
 
@@ -119,4 +119,4 @@ While initially developed for **mushroom cultivation**—which requires strict c
 | **GND** |  100k Resistor connected to **GPIO 34** | No Sensor Signal (Soil Sensor) |
 | **GND / 3V3 / 5V** | Power Supply | Power distribution for modules and sensors |
 
-*[![Esquema Elétrico do Greenhouse Link](circuit_image.png)].*
+*![Esquema Elétrico do Greenhouse Link](Wiring_Diagramas/circuit_image.png).*
