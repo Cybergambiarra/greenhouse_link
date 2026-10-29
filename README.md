@@ -55,6 +55,7 @@ Embora o foco inicial tenha sido a **produção de cogumelos** (que exigem contr
 | **GPIO 27** | Saída Digital (Relê 9) | Acionamento da Luz Branca 1 (Espectro Total ou Fria) |
 | **GPIO 12** | Saída Digital (Relê 10) | Acionamento da Luz Branca 2 (Espectro Total ou Quente) |
 | **GPIO 13** | Saída Digital (Relê 11) | Acionamento da Luz Ultravioleta (Ideal Ultravioleta, Pode ser Branca) |
+| **GPIO X** | Saída Digital (Relê 12) | Reservado (canal reserva) |
 | **GND** | Resistor de 100k conectado ao **GPIO 34** | Sinal Sem Sensor (Sensor de solo) |
 | **GND / 3V3 / 5V**| Alimentação | Distribuição de energia para módulos e sensores |
 
@@ -112,6 +113,7 @@ While initially developed for **mushroom cultivation**—which requires strict c
 | **GPIO 27** | Digital Output (Relay 9) | White Light 1 Activation (Full Spectrum or Cool White) |
 | **GPIO 12** | Digital Output (Relay 10) | White Light 2 Activation (Full Spectrum or Warm White) |
 | **GPIO 13** | Digital Output (Relay 11) | Activation of Ultraviolet Light (Ultraviolet is ideal; white light is also acceptable) |
+| **GPIO X** | Digital Output (Relay 12) | Reserved (spare channel) |
 | **GND** |  100k Resistor connected to **GPIO 34** | No Sensor Signal (Soil Sensor) |
 | **GND / 3V3 / 5V** | Power Supply | Power distribution for modules and sensors |
 
